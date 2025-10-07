@@ -38,7 +38,7 @@ except Exception:
 @dataclass
 class Config:
     SYMBOL: str = "XAUUSDm"
-    HISTORY_BARS: int = 100000
+    HISTORY_BARS: int = 50000
     ATR_PERIOD: int = 14
     RSI_PERIOD: int = 14
     MA_PERIOD: int = 50
