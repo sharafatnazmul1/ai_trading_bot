@@ -2,6 +2,7 @@
 
 import os
 import sys
+import joblib
 import time
 import logging
 from logging.handlers import RotatingFileHandler
@@ -151,54 +152,61 @@ class DataFetcher:
         if 'time' in df.columns:
             df['time'] = pd.to_datetime(df['time'], unit='s')
         return df
-
-    def preprocess_data(self, df: pd.DataFrame) -> np.ndarray:
-        # Robust preprocessing with extra engineered features
+    
+    def preprocess_data(self, df: pd.DataFrame, fit_scaler: bool = True) -> np.ndarray:
+        """
+        Preprocess dataframe into feature matrix.
+        If fit_scaler==True: fit new MinMaxScaler and store it (used during training).
+        If fit_scaler==False: require self.scaler to be present and use transform() (used during live inference).
+        """
         df = df.copy()
         df['time'] = pd.to_datetime(df['time'])
         df['ATR'] = compute_atr(df['high'], df['low'], df['close'], self.config.ATR_PERIOD)
         df['RSI'] = compute_rsi(df['close'], self.config.RSI_PERIOD)
         df['MA'] = compute_sma(df['close'], self.config.MA_PERIOD)
         df['log_return'] = np.log(df['close']).diff().fillna(0.0)
-
-        # EMAs
+        # EMAs, BB, cyclical
         df['EMA5'] = compute_ema(df['close'], span=self.config.EMA_SHORT)
         df['EMA20'] = compute_ema(df['close'], span=self.config.EMA_LONG)
-
-        # Bollinger band width (normalized)
         df['bb_width'] = compute_bband_width(df['close'], window=self.config.EMA_LONG)
-
-        # Time of day cyclic features (UTC)
         df['hour'] = df['time'].dt.hour + df['time'].dt.minute / 60.0
         df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24.0)
         df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24.0)
-
-        # lagged returns
         for lag in range(1, self.config.LAG + 1):
             df[f'lag_{lag}'] = df['log_return'].shift(lag).fillna(0.0)
-
+        # z-score + vol_norm
+        mean = df['log_return'].rolling(200).mean()
+        std = df['log_return'].rolling(200).std().replace(0, np.nan)
+        df['zscore_ret'] = ((df['log_return'] - mean) / std).fillna(0.0)
+        df['vol_norm'] = df['ATR'] / df['ATR'].rolling(200).mean().fillna(df['ATR'].mean())
         df = df.dropna().reset_index(drop=True)
         if df.empty:
             raise ValueError('Preprocessing produced empty dataframe after feature engineering')
-
-        # save raw close & df
+        # save raw data
         self.last_df = df.copy()
         self.raw_close = df['close'].values
-
-        # explicit feature order — keep 'close' present so fallback uses index
+        # define features order and names (must be identical for training & inference)
         feature_cols = [
-            'open', 'high', 'low', 'close', 'ATR', 'RSI', 'MA', 'log_return',
-            'EMA5', 'EMA20', 'bb_width', 'hour_sin', 'hour_cos'
+            'open','high','low','close','ATR','RSI','MA','log_return',
+            'EMA5','EMA20','bb_width','hour_sin','hour_cos','zscore_ret','vol_norm'
         ] + [f'lag_{i}' for i in range(1, self.config.LAG + 1)]
-
+        self.feature_names = feature_cols
         features_df = df[feature_cols].ffill()
-        self.feature_names = feature_cols  # important: used elsewhere for fallback index
-        self.scaler = MinMaxScaler()
-        scaled = self.scaler.fit_transform(features_df.values)
+        if fit_scaler:
+            self.scaler = MinMaxScaler()
+            scaled = self.scaler.fit_transform(features_df.values)
+        else:
+            if self.scaler is None:
+                raise RuntimeError('Scaler is not initialized; cannot preprocess in inference-mode.')
+            scaled = self.scaler.transform(features_df.values)
         return scaled
 
-
-    def prepare_mode_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    def prepare_mode_data(self, df: pd.DataFrame, fit_scaler: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Prepare mode features and labels.
+        If fit_scaler==True: fit new scaler for mode features and store it (.mode_scaler).
+        If fit_scaler==False: require self.mode_scaler present and use it.
+        """
         df = df.copy()
         df['ATR'] = compute_atr(df['high'], df['low'], df['close'], self.config.ATR_PERIOD)
         df['RSI'] = compute_rsi(df['close'], self.config.RSI_PERIOD)
@@ -206,7 +214,6 @@ class DataFetcher:
         df = df.dropna().reset_index(drop=True)
         if len(df) < 2:
             return np.zeros((0, 3), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-
         labels = []
         mult = getattr(self.config, 'PRICE_THRESHOLD_ATR_MULTIPLIER', 0.8)
         for i in range(1, len(df)):
@@ -215,12 +222,17 @@ class DataFetcher:
             move = abs(curr - prev)
             threshold = df['ATR'].iloc[i] * mult
             labels.append(1.0 if move > threshold else 0.0)
-
-        # features for mode classifier (ATR, RSI, MA) — can expand if needed
-        feat = df[['ATR', 'RSI', 'MA']].iloc[1:].values
-        scaler = MinMaxScaler()
-        scaled_features = scaler.fit_transform(feat)
+        feat = df[['ATR','RSI','MA']].iloc[1:].values
+        if fit_scaler:
+            self.mode_scaler = MinMaxScaler()
+            scaled_features = self.mode_scaler.fit_transform(feat)
+        else:
+            if getattr(self, 'mode_scaler', None) is None:
+                raise RuntimeError('Mode scaler missing; cannot prepare mode data in inference mode.')
+            scaled_features = self.mode_scaler.transform(feat)
         labels_arr = np.array(labels, dtype=np.float32)
+        # store for reference
+        self.last_mode_labels = labels_arr
         logger.info(f"Mode labels balance: {np.mean(labels_arr) * 100:.2f}% aggressive")
         return scaled_features.astype(np.float32), labels_arr
 
@@ -314,13 +326,26 @@ class ModelTrainer:
 
     def save_model(self):
         try:
+            price_path = os.path.join(self.config.MODEL_DIR, 'price_model.pt')
+            mode_path = os.path.join(self.config.MODEL_DIR, 'mode_model.pt')
+            scaler_path = os.path.join(self.config.MODEL_DIR, 'scaler.pkl')
+            mode_scaler_path = os.path.join(self.config.MODEL_DIR, 'mode_scaler.pkl')
+            fn_path = os.path.join(self.config.MODEL_DIR, 'feature_names.pkl')
             if self.price_model is not None:
-                torch.save(self.price_model.state_dict(), os.path.join(self.config.MODEL_DIR, 'price_model.pt'))
+                torch.save(self.price_model.state_dict(), price_path)
             if self.mode_model is not None:
-                torch.save(self.mode_model.state_dict(), os.path.join(self.config.MODEL_DIR, 'mode_model.pt'))
-            logger.info('Models saved')
+                torch.save(self.mode_model.state_dict(), mode_path)
+            # save scalers and feature names from data_fetcher (if available)
+            if getattr(self.data_fetcher, 'scaler', None) is not None:
+                joblib.dump(self.data_fetcher.scaler, scaler_path)
+            if getattr(self.data_fetcher, 'mode_scaler', None) is not None:
+                joblib.dump(self.data_fetcher.mode_scaler, mode_scaler_path)
+            if getattr(self.data_fetcher, 'feature_names', None) is not None:
+                joblib.dump(self.data_fetcher.feature_names, fn_path)
+            logger.info('Models and scalers saved')
         except Exception as e:
             logger.exception('Failed to save models: %s', e)
+
 
     def load_model(self):
         try:
@@ -333,6 +358,42 @@ class ModelTrainer:
                 logger.info('Mode model file exists; load in main when shapes known')
         except Exception as e:
             logger.exception('Load model exception: %s', e)
+
+
+    def try_load_models(self) -> bool:
+        """
+        Try to load price/model state_dicts + scalers. Return True if success.
+        """
+        try:
+            price_path = os.path.join(self.config.MODEL_DIR, 'price_model.pt')
+            mode_path = os.path.join(self.config.MODEL_DIR, 'mode_model.pt')
+            scaler_path = os.path.join(self.config.MODEL_DIR, 'scaler.pkl')
+            mode_scaler_path = os.path.join(self.config.MODEL_DIR, 'mode_scaler.pkl')
+            fn_path = os.path.join(self.config.MODEL_DIR, 'feature_names.pkl')
+            if not (os.path.exists(price_path) and os.path.exists(mode_path) and os.path.exists(scaler_path)):
+                logger.info('Saved models/scaler not found; will train new models.')
+                return False
+            # load scalers & feature_names
+            self.data_fetcher.scaler = joblib.load(scaler_path)
+            if os.path.exists(mode_scaler_path):
+                self.data_fetcher.mode_scaler = joblib.load(mode_scaler_path)
+            if os.path.exists(fn_path):
+                self.data_fetcher.feature_names = joblib.load(fn_path)
+            # reconstruct model shapes
+            input_size = len(self.data_fetcher.feature_names) if getattr(self.data_fetcher, 'feature_names', None) else 15
+            self.price_model = LSTMModel(input_size=input_size).to(self.device)
+            self.price_model.load_state_dict(torch.load(price_path, map_location=self.device))
+            # mode model input size was 3 (ATR,RSI,MA) as designed
+            self.mode_model = ModeClassifier(input_size=3).to(self.device)
+            self.mode_model.load_state_dict(torch.load(mode_path, map_location=self.device))
+            self.price_model.eval(); self.mode_model.eval()
+            logger.info('Loaded price & mode models and scalers from disk')
+            return True
+        except Exception as e:
+            logger.exception('Failed to load models: %s', e)
+            return False
+
+
 
     def create_sequences(self, data: np.ndarray, labels: Optional[np.ndarray] = None, is_mode: bool = False):
         X, y = [], []
@@ -611,15 +672,19 @@ class Executor:
             return False
 
     def place_order(self, action: str, pred_price: float, mode: str, win_rate: float = 0.55, rr: float = 2.0):
-        # High-level safe wrapper
+        # Reject non-trade actions early
+        if action not in ('BUY', 'SELL'):
+            logger.info(f"Action is {action}; not placing order.")
+            return None
         try:
             if self.has_open_position():
                 logger.info('Already have open position; skipping new order')
                 return None
             if mt5 is None:
                 logger.info('MT5 not available; running in dry-run, not sending real order')
-                logger.info(f'DRYRUN: {action} at predicted {pred_price:.5f} mode {mode}')
+                logger.info(f'DRYRUN: {action} at predicted {pred_price} mode {mode}')
                 return None
+            # rest of original safe order placement logic...
             symbol_info = mt5.symbol_info(self.config.SYMBOL)
             if symbol_info is None:
                 logger.warning('Symbol info missing from MT5')
@@ -654,7 +719,6 @@ class Executor:
                 logger.warning('Account info missing')
                 return None
             account_balance = float(account_info.balance)
-            # Kelly fraction bounded
             kelly_fraction = (win_rate * (rr + 1) - 1) / rr
             kelly_fraction = max(0.01, min(kelly_fraction, 0.1))
             risk_amount = account_balance * kelly_fraction
@@ -695,7 +759,6 @@ class Executor:
             logger.exception('Exception in place_order: %s', e)
             return None
 
-
 # ---------- Utility: synthetic test data generator ----------
 def generate_synthetic_data(bars: int = 2000, start_price: float = 2000.0) -> pd.DataFrame:
     # simple geometric random walk with daily seasonality-ish noise
@@ -729,56 +792,77 @@ def main(args):
     if args.test:
         logger.info('Running in self-test mode with synthetic data')
         df = generate_synthetic_data(bars=4000, start_price=2000.0)
-        scaled = dfetch.preprocess_data(df)
-        mode_data, mode_labels = dfetch.prepare_mode_data(df)
-        # quick train (this should run without exceptions and produce models)
+        scaled = dfetch.preprocess_data(df, fit_scaler=True)
+        mode_data, mode_labels = dfetch.prepare_mode_data(df, fit_scaler=True)
         trainer.train(scaled, mode_data, mode_labels)
-        # if models trained, do a prediction
         if trainer.price_model is not None:
             try:
                 action, mode = trainer.predict(scaled, mode_data)
                 logger.info(f'SMOKE TEST PREDICT -> Action: {action}, Mode: {mode}')
             except Exception as e:
                 logger.exception('Prediction failed in test: %s', e)
-        logger.info('Self-test complete. Inspect logs for any errors.')
+        logger.info('Self-test complete.')
         return
 
-    # Non-test: fetch from MT5 (if available)
-    if mt5 is not None:
-        if not dfetch.connect_mt5():
-            logger.warning('Could not initialize MT5. Use --test for synthetic run')
-            return
-    else:
+    # LIVE path
+    if mt5 is None:
         logger.warning('MT5 library not present. Use --test for offline run')
         return
 
-    # fetch history
+    if not dfetch.connect_mt5():
+        logger.warning('Could not initialize MT5. Abort.')
+        return
+
+    # fetch historical once for initial train/fit or inference scaler
     try:
-        df = dfetch.fetch_rates(cfg.HISTORY_BARS)
+        df_hist = dfetch.fetch_rates(cfg.HISTORY_BARS)
     except Exception as e:
         logger.exception('Failed to fetch MT5 rates: %s', e)
         return
 
-    try:
-        scaled = dfetch.preprocess_data(df)
-        mode_data, mode_labels = dfetch.prepare_mode_data(df)
-    except Exception as e:
-        logger.exception('Preprocessing failed: %s', e)
-        return
+    # Try to load models+scalers from disk
+    loaded = trainer.try_load_models()
 
-    # Train models
-    trainer.train(scaled, mode_data, mode_labels)
+    if not loaded:
+        # perform preprocessing + train (fit scalers)
+        try:
+            scaled = dfetch.preprocess_data(df_hist, fit_scaler=True)
+            mode_data, mode_labels = dfetch.prepare_mode_data(df_hist, fit_scaler=True)
+        except Exception as e:
+            logger.exception('Preprocessing failed: %s', e)
+            return
+        trainer.train(scaled, mode_data, mode_labels)
+    else:
+        # we loaded scaler(s) and models; need to transform history with loaded scalers
+        try:
+            scaled = dfetch.preprocess_data(df_hist, fit_scaler=False)
+            mode_data, mode_labels = dfetch.prepare_mode_data(df_hist, fit_scaler=False)
+        except Exception as e:
+            logger.exception('Preprocessing with loaded scalers failed: %s', e)
+            return
 
-    # Predict and optionally place order
+    # final models should exist now (either loaded or trained); enter live loop
+    logger.info('Entering live trading loop (dry-run unless --live passed)')
     try:
-        action, mode = trainer.predict(scaled, mode_data)
-        logger.info(f'Final decision: {action} ({mode})')
-        if args.live:
-            execer.place_order(action, None, mode)
-        else:
-            logger.info('Dry-run: not sending real orders. Use --live to enable live trading.')
+        while True:
+            try:
+                df_now = dfetch.fetch_rates(500)  # last N bars (adjustable)
+                scaled_now = dfetch.preprocess_data(df_now, fit_scaler=False)
+                mode_now, _ = dfetch.prepare_mode_data(df_now, fit_scaler=False)
+                action, mode = trainer.predict(scaled_now, mode_now)
+                logger.info(f'Live decision: {action} ({mode})')
+                if args.live and action in ('BUY', 'SELL'):
+                    execer.place_order(action, None, mode)
+                else:
+                    logger.info('Not placing order (dry-run or HOLD).')
+            except Exception as e:
+                logger.exception('Error during live loop iteration: %s', e)
+            # sleep between iterations
+            time.sleep(getattr(cfg, 'LIVE_LOOP_SLEEP', 60))
+    except KeyboardInterrupt:
+        logger.info('Interrupted by user; exiting.')
     except Exception as e:
-        logger.exception('Prediction/Execution failed: %s', e)
+        logger.exception('Unhandled in live loop: %s', e)
 
 
 if __name__ == '__main__':
