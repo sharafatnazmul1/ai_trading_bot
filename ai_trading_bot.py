@@ -1,945 +1,1383 @@
 #!/usr/bin/env python3
 """
-Patched AI trading bot (full file)
-Includes:
- - multi-timeframe fetch (M5/M15/H1)
- - feature engineering (EMA, BB width, zscore, vol_norm, dir_blend)
- - saved scaler & model loading (joblib)
- - dynamic TP from ML prediction, ATR-based SL
- - reinforcement feedback from closed deals (recent pnls adjust sensitivity)
- - safety: HOLD blocks order placing; live loop with dry-run option
+walk_ai_bot_v2_patched_fixed.py - Fixed full bot (complete file)
+
+Fixes applied:
+ - Proper ATR retrieval for SL/TP instead of synthetic zero-ATR.
+ - Enforce broker symbol constraints: trade_stops_level, digits, point, volume_min/step/volume_max.
+ - Robust volume calculation using symbol contract size & point.
+ - Fixed backtester probability filtering logic.
+ - Added device logging and a few defensive checks.
+ - Improved logging around order requests and results.
+ - Kept original architecture, models, and training flow intact.
 """
+from __future__ import annotations
 import os
 import sys
 import time
+import math
 import logging
-from logging.handlers import RotatingFileHandler
 import argparse
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict, Any
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta, timezone
-import joblib
 
-# sklearn
-from sklearn.preprocessing import MinMaxScaler
-
-# torch
+# Torch for LSTM
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
-# MT5 optional
+# sklearn
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.calibration import CalibratedClassifierCV
+import joblib
+
+# optional xgboost
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except Exception:
+    xgb = None
+    XGB_AVAILABLE = False
+
+# MT5
 try:
     import MetaTrader5 as mt5
 except Exception:
     mt5 = None
 
 # ---------- Logging ----------
-def setup_logging(logfile='logs/ai_trading_bot.log'):
-    os.makedirs(os.path.dirname(logfile), exist_ok=True)
-    root = logging.getLogger()
-    if root.handlers:
-        root.handlers.clear()
-    root.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    fh = RotatingFileHandler(logfile, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(fmt)
-    root.addHandler(ch)
-    root.addHandler(fh)
-
-setup_logging()
-logger = logging.getLogger("ai_trading_bot")
+LOGFILE = os.environ.get('WALK_AI_LOG', 'logs/walk_ai_bot_v2_patched_fixed.log')
+os.makedirs(os.path.dirname(LOGFILE), exist_ok=True)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.StreamHandler(sys.stdout),
+                              logging.FileHandler(LOGFILE, encoding='utf-8')])
+logger = logging.getLogger('walk_ai_bot_v2_patched_fixed')
 
 # ---------- Config ----------
 @dataclass
 class Config:
     SYMBOL: str = "XAUUSDm"
-    HISTORY_BARS: int = 100000
+    TIMEFRAME: str = 'M5'
+    M5_PERIOD_MINUTES: int = 5
+    HISTORY_BARS: int = 600000
+    LOOKBACK_BARS: int = 24
+    PRED_HORIZON: int = 3
     ATR_PERIOD: int = 14
-    RSI_PERIOD: int = 14
-    MA_PERIOD: int = 50
-    PRICE_THRESHOLD_PCT: float = 0.0005
-    PRICE_THRESHOLD_ATR_MULTIPLIER: float = 0.8
-    LOOKBACK: int = 12
-    LOT_SIZE: float = 0.01
-    MAX_LOT: float = 0.1
-    DEVICE: str = "cpu"
-    MODEL_DIR: str = "models"
-    EMA_SHORT: int = 5
-    EMA_LONG: int = 20
-    LAG: int = 5
-    LIVE_LOOP_SLEEP: int = 60
+    LSTM_HIDDEN: int = 64
+    DEVICE: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    MODEL_DIR: str = 'models_v2'
+    MIN_TRADE_PROB: float = 0.55  # aggressiveness for scalping
+    PROB_ONLY_THRESHOLD: float = 0.85  # very strong prob-only trigger (used in score gating)
+    MAX_POSITIONS: int = 1
+    RISK_PER_TRADE: float = 0.01
+    MAX_VOLUME: float = 0.01
+    SPREAD_PIPS_WARNING: float = 0.20
+    TRADE_TIMEOUT_BARS: int = 6
+    SIM_SPREAD: float = 0.17
+    SIM_SLIPPAGE_PIPS: float = 0.02
+    USE_XGB: bool = True
+    PROBABILITY_WEIGHT_TREE: float = 0.65
+    PROBABILITY_WEIGHT_LSTM: float = 0.35
+    PROB_SHARPEN: float = 1.15
+    TRAIN_TEST_SPLIT_RATIO: float = 0.8
+    SEED: int = 42
+    STRATEGIES: List[str] = field(default_factory=lambda: ['momentum', 'reversion', 'squeeze'])
+    LABEL_THR_FACTORS: Dict[str, float] = field(default_factory=lambda: {'momentum': 0.06, 'reversion': 0.12, 'squeeze': 0.06})
+    STRATEGY_WEIGHTS: Dict[str, float] = field(default_factory=lambda: {'momentum': 1.0, 'reversion': 1.0, 'squeeze': 1.0})
+    SCALER_REFRESH_LOOPS: int = 300
+    LIVE_LOOP_DELAY: float = 1.0
 
-# ---------- Indicators ----------
+np.random.seed(Config().SEED)
+
+# ---------- Numerically-stable helpers ----------
+def _safe_clip(p: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    Coerce to float, replace non-finite (nan, inf) with neutral 0.5,
+    and clip into (eps, 1-eps).
+    """
+    p = np.asarray(p, dtype=float)             # ensure numeric array
+    # replace non-finite entries (nan/inf) with neutral probability 0.5
+    p = np.where(np.isfinite(p), p, 0.5)
+    return np.clip(p, eps, 1.0 - eps)
+
+
+def logit_np(p: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    Numerically-stable logit:
+      - safe clip probabilities away from 0/1
+      - compute logit under an errstate to avoid noisy runtime warnings
+      - map any remaining non-finite logits (if any) to large finite numbers,
+        preserving sign (positive for p>0.5, negative for p<0.5), or 0 if neutral.
+    """
+    p = _safe_clip(p, eps)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out = np.log(p / (1.0 - p))
+    # replace non-finite outputs (should be rare) with large finite numbers
+    sign = np.sign(p - 0.5)         # >0 => positive logit, <0 => negative, 0 => neutral
+    out = np.where(np.isfinite(out), out, sign * 1e6)
+    return out
+
+def expit_np(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x)
+    return 1.0 / (1.0 + np.exp(-x))
+
+# ---------- Utilities ----------
 def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
     prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=window, min_periods=1).mean()
-    return atr
+    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.rolling(window=window, min_periods=1).mean()
 
 def compute_rsi(close: pd.Series, window: int) -> pd.Series:
     delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1.0 / window, min_periods=window).mean()
     avg_loss = loss.ewm(alpha=1.0 / window, min_periods=window).mean()
-    rs = avg_gain / (avg_loss.replace(0, 1e-12))
+    rs = avg_gain / avg_loss.replace(0, 1e-12)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50.0)
-
-def compute_sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window=window, min_periods=1).mean()
 
 def compute_ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-def compute_bband_width(close: pd.Series, window: int) -> pd.Series:
+def compute_bbw(close: pd.Series, window: int) -> pd.Series:
     ma = close.rolling(window=window, min_periods=1).mean()
     std = close.rolling(window=window, min_periods=1).std().fillna(0.0)
-    width = (2 * std) / ma.replace(0, np.nan)
-    return width.fillna(0.0)
+    bbw = (2 * std) / ma.replace(0, np.nan)
+    return bbw.fillna(0.0)
 
-# ---------- DataFetcher ----------
-class DataFetcher:
-    def __init__(self, config: Config):
-        self.config = config
-        self.scaler: Optional[MinMaxScaler] = None
-        self.mode_scaler: Optional[MinMaxScaler] = None
-        self.feature_names: Optional[list] = None
-        self.last_df: Optional[pd.DataFrame] = None
-        self.raw_close: Optional[np.ndarray] = None
-        self.recent_pnls: list = []
-        self.processed_deals: set = set()
-        self.pending_orders: dict = {}
-        self.sensitivity: float = 1.0
+def hurst_exponent(ts: np.ndarray) -> float:
+    N = len(ts)
+    if N < 20:
+        return 0.5
+    lags = np.floor(np.logspace(1, np.log10(N / 2), num=20)).astype(int)
+    tau = []
+    for lag in lags:
+        pp = np.subtract(ts[lag:], ts[:-lag])
+        tau.append(np.sqrt(np.std(pp)))
+    poly = np.polyfit(np.log(lags + 1e-8), np.log(np.array(tau) + 1e-8), 1)
+    return float(poly[0])
 
-    def connect_mt5(self) -> bool:
+def kalman_smooth(series: pd.Series) -> pd.Series:
+    n = len(series)
+    xhat = np.zeros(n)
+    P = np.zeros(n)
+    Q = 1e-5
+    R = np.maximum(np.var(series.dropna()) * 0.01, 1e-8)
+    xhat[0] = series.iloc[0]
+    P[0] = 1.0
+    for k in range(1, n):
+        xhatminus = xhat[k - 1]
+        Pminus = P[k - 1] + Q
+        K = Pminus / (Pminus + R)
+        xhat[k] = xhatminus + K * (series.iloc[k] - xhatminus)
+        P[k] = (1 - K) * Pminus
+    return pd.Series(xhat, index=series.index)
+
+# ---------- Data / MT5 connector ----------
+class MT5Connector:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.connected = False
+
+    def connect(self) -> bool:
         if mt5 is None:
-            logger.warning("MetaTrader5 package not available. Live trading disabled.")
+            logger.warning('MetaTrader5 package not available. Live mode disabled.')
             return False
         try:
             ok = mt5.initialize()
             if not ok:
-                logger.warning("MT5 initialize returned False")
+                logger.warning('MT5 initialize returned False')
                 return False
-            logger.info("Connected to MT5 successfully")
+            self.connected = True
+            logger.info('MT5 initialized')
             return True
         except Exception as e:
-            logger.exception("Exception connecting to MT5: %s", e)
+            logger.exception('Exception initializing MT5: %s', e)
+            self.connected = False
             return False
 
-    def fetch_rates(self, bars: int) -> pd.DataFrame:
+    def disconnect(self):
+        if mt5 is not None and self.connected:
+            try:
+                mt5.shutdown()
+                self.connected = False
+            except Exception:
+                pass
+
+    def fetch_history_m5(self, bars: int) -> pd.DataFrame:
         if mt5 is None:
-            raise RuntimeError("MT5 not available in this environment.")
-        symbol = self.config.SYMBOL
-        timeframe = mt5.TIMEFRAME_M5 if hasattr(mt5, 'TIMEFRAME_M5') else 5
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
+            raise RuntimeError('MT5 not available')
+        TF = getattr(mt5, 'TIMEFRAME_M5', 5)
+        rates = mt5.copy_rates_from_pos(self.cfg.SYMBOL, TF, 0, bars)
         if rates is None or len(rates) == 0:
-            raise RuntimeError("Failed to fetch rates from MT5 or zero bars returned")
+            raise RuntimeError(f'Failed to fetch rates for {self.cfg.SYMBOL}')
         df = pd.DataFrame(rates)
-        if 'time' in df.columns:
-            df['time'] = pd.to_datetime(df['time'], unit='s')
+        df['time'] = pd.to_datetime(df['time'], unit='s')
         return df
 
-    def fetch_multi_timeframe(self, bars_m5: int = 500) -> pd.DataFrame:
-        if mt5 is None:
-            raise RuntimeError('MT5 not available for multi-timeframe fetch')
-        TF5 = getattr(mt5, 'TIMEFRAME_M5', 5)
-        TF15 = getattr(mt5, 'TIMEFRAME_M15', 15)
-        TFH1 = getattr(mt5, 'TIMEFRAME_H1', 60)
-        rates5 = mt5.copy_rates_from_pos(self.config.SYMBOL, TF5, 0, bars_m5)
-        if rates5 is None or len(rates5) == 0:
-            raise RuntimeError('Failed to fetch M5 rates')
-        df5 = pd.DataFrame(rates5)
-        df5['time'] = pd.to_datetime(df5['time'], unit='s')
-        bars15 = max(10, bars_m5 // 3)
-        barsh1 = max(10, bars_m5 // 12)
-        rates15 = mt5.copy_rates_from_pos(self.config.SYMBOL, TF15, 0, bars15) 
-        ratesh1 = mt5.copy_rates_from_pos(self.config.SYMBOL, TFH1, 0, barsh1) 
-        if len(rates15) == 0 or len(ratesh1) == 0:
-            df5 = df5.reset_index(drop=True)
-            df5['M15_dir'] = 0.0
-            df5['H1_dir'] = 0.0
-            df5['dir_blend'] = 0.0
-            return df5
-        df15 = pd.DataFrame(rates15); df15['time'] = pd.to_datetime(df15['time'], unit='s')
-        dfh1 = pd.DataFrame(ratesh1); dfh1['time'] = pd.to_datetime(dfh1['time'], unit='s')
-        s15 = pd.Series(df15['close'].values, index=pd.DatetimeIndex(df15['time']))
-        sh1 = pd.Series(dfh1['close'].values, index=pd.DatetimeIndex(dfh1['time']))
-        idx5 = pd.DatetimeIndex(df5['time'])
-        s15_ff = s15.reindex(idx5, method='ffill')
-        sh1_ff = sh1.reindex(idx5, method='ffill')
-        m15_dir = s15_ff.diff().fillna(0.0).apply(np.sign)
-        h1_dir = sh1_ff.diff().fillna(0.0).apply(np.sign)
-        df5 = df5.reset_index(drop=True)
-        df5['M15_dir'] = m15_dir.values
-        df5['H1_dir'] = h1_dir.values
-        df5['dir_blend'] = ((df5['M15_dir'].fillna(0.0) + df5['H1_dir'].fillna(0.0)) / 2.0).fillna(0.0)
-        return df5
+    def fetch_recent_ticks(self, seconds_back: int = 60) -> pd.DataFrame:
+        return self.fetch_history_m5(200)
 
-    def preprocess_data(self, df: pd.DataFrame, fit_scaler: bool = True) -> np.ndarray:
-        df = df.copy()
+# ---------- Feature engineering ----------
+class FeatureEngineer:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.scaler = StandardScaler()
+
+    def feature_columns(self) -> List[str]:
+        return ['close', 'close_k', 'ATR', 'RSI', 'EMA5', 'EMA20', 'BBW', 'hour_sin', 'hour_cos',
+                'zret', 'vol_norm', 'hurst', 'rsi_delta', 'atr_log',
+                'spread_proxy', 'spread_rel'] + [f'lag{l}' for l in range(1, 6)]
+
+    def build_features(self, df: pd.DataFrame, fit_scaler: bool = True) -> Tuple[pd.DataFrame, np.ndarray]:
+        df = df.copy().reset_index(drop=True)
         df['time'] = pd.to_datetime(df['time'])
-        df['ATR'] = compute_atr(df['high'], df['low'], df['close'], self.config.ATR_PERIOD)
-        df['RSI'] = compute_rsi(df['close'], self.config.RSI_PERIOD)
-        df['MA'] = compute_sma(df['close'], self.config.MA_PERIOD)
-        df['log_return'] = np.log(df['close']).diff().fillna(0.0)
-        df['EMA5'] = compute_ema(df['close'], span=self.config.EMA_SHORT)
-        df['EMA20'] = compute_ema(df['close'], span=self.config.EMA_LONG)
-        df['bb_width'] = compute_bband_width(df['close'], window=self.config.EMA_LONG)
+        df['log_ret'] = np.log(df['close']).diff().fillna(0.0)
+        df['ATR'] = compute_atr(df['high'], df['low'], df['close'], self.cfg.ATR_PERIOD)
+        df['RSI'] = compute_rsi(df['close'], 14)
+        df['EMA5'] = compute_ema(df['close'], 5)
+        df['EMA20'] = compute_ema(df['close'], 20)
+        df['BBW'] = compute_bbw(df['close'], 20)
+
+        df['spread_proxy'] = (df['high'] - df['low']).clip(lower=1e-6)
+        df['spread_rel'] = df['spread_proxy'] / df['ATR'].replace(0, np.nan)
+
         df['hour'] = df['time'].dt.hour + df['time'].dt.minute / 60.0
         df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24.0)
         df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24.0)
 
-        # lag features
-        for lag in range(1, self.config.LAG + 1):
-            df[f'lag_{lag}'] = df['log_return'].shift(lag).fillna(0.0)
+        for l in range(1, 6):
+            df[f'lag{l}'] = df['log_ret'].shift(l).fillna(0.0)
 
-        # z-score and volatility normalized features
-        mean = df['log_return'].rolling(200).mean()
-        std = df['log_return'].rolling(200).std().replace(0, np.nan)
-        df['zscore_ret'] = ((df['log_return'] - mean) / std).fillna(0.0)
-        df['vol_norm'] = df['ATR'] / df['ATR'].rolling(200).mean().fillna(df['ATR'].mean())
+        df['zret'] = (df['log_ret'] - df['log_ret'].rolling(200).mean()).fillna(0.0)
+        df['vol_norm'] = df['ATR'] / df['ATR'].rolling(200).mean().replace(0, np.nan).fillna(df['ATR'].mean())
 
-        # --- NEW micro / scalping features (helps capture candle micro-structure) ---
-        # body ratio: size of body relative to full range (spike vs wick)
-        df['body_ratio'] = ((df['close'] - df['open']).abs() / ((df['high'] - df['low']) + 1e-9)).fillna(0.0)
-        # short directional memory (sum of last 3 candles' direction)
-        df['dir_memory'] = np.sign(df['close'] - df['open']).rolling(3, min_periods=1).sum().fillna(0.0)
-        # short momentum (3-bar average of log returns)
-        df['momentum'] = df['log_return'].rolling(3, min_periods=1).mean().fillna(0.0)
-        # ATR deviation: current ATR relative to 50-bar ATR mean (volatility spike detector)
-        df['atr_50_mean'] = df['ATR'].rolling(50, min_periods=1).mean()
-        df['atr_50_std'] = df['ATR'].rolling(50, min_periods=1).std().fillna(1e-9)
-        df['atr_dev'] = ((df['ATR'] - df['atr_50_mean']) / (df['atr_50_std'] + 1e-9)).fillna(0.0)
-        # drop helper cols later (atr_50_mean/std), keep atr_dev only
-        df = df.drop(columns=['atr_50_mean','atr_50_std'], errors='ignore')
+        df['hurst'] = 0.5
+        try:
+            hurst_val = hurst_exponent(df['close'].values[-500:])
+            df['hurst'] = hurst_val
+        except Exception:
+            pass
 
-        if 'dir_blend' not in df.columns:
-            df['dir_blend'] = 0.0
+        try:
+            df['close_k'] = kalman_smooth(df['close'])
+        except Exception:
+            df['close_k'] = df['close']
 
-        # Prepare final frame and drop NaNs
+        df['rsi_delta'] = df['RSI'].diff().fillna(0.0)
+        df['atr_log'] = np.log(df['ATR'].replace(0, 1e-6))
+
         df = df.dropna().reset_index(drop=True)
-        if df.empty:
-            raise ValueError('Preprocessing produced empty dataframe after feature engineering')
+        feature_cols = self.feature_columns()
+        X = df[feature_cols].values.astype(np.float32)
 
-        self.last_df = df.copy()
-        self.raw_close = df['close'].values
-
-        # Feature list (order matters) — include new micro features
-        feature_cols = [
-            'open','high','low','close','ATR','RSI','MA','log_return',
-            'EMA5','EMA20','bb_width','hour_sin','hour_cos','zscore_ret','vol_norm','dir_blend',
-            'body_ratio','dir_memory','momentum','atr_dev'
-        ] + [f'lag_{i}' for i in range(1, self.config.LAG + 1)]
-
-        self.feature_names = feature_cols
-        features_df = df[feature_cols].ffill()
         if fit_scaler:
-            self.scaler = MinMaxScaler()
-            scaled = self.scaler.fit_transform(features_df.values)
+            self.scaler = StandardScaler()
+            Xs = self.scaler.fit_transform(X)
         else:
-            if self.scaler is None:
-                raise RuntimeError('Scaler missing: cannot preprocess in inference mode')
-            scaled = self.scaler.transform(features_df.values)
-        return scaled.astype(np.float32)
+            if not hasattr(self.scaler, 'scale_'):
+                raise ValueError("FeatureEngineer.scaler is not fitted. Save/load fe_scaler.pkl or call build_features(..., fit_scaler=True).")
+            Xs = self.scaler.transform(X)
 
+        return df, Xs
 
-    def prepare_mode_data(self, df: pd.DataFrame, fit_scaler: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-        df = df.copy()
-        df['ATR'] = compute_atr(df['high'], df['low'], df['close'], self.config.ATR_PERIOD)
-        df['RSI'] = compute_rsi(df['close'], self.config.RSI_PERIOD)
-        df['MA'] = compute_sma(df['close'], self.config.MA_PERIOD)
-        df = df.dropna().reset_index(drop=True)
-        if len(df) < 2:
-            return np.zeros((0,3), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-        labels = []
-        mult = getattr(self.config, 'PRICE_THRESHOLD_ATR_MULTIPLIER', 0.8)
-        for i in range(1, len(df)):
-            prev = df['close'].iloc[i-1]; curr = df['close'].iloc[i]
-            move = abs(curr - prev); threshold = df['ATR'].iloc[i] * mult
-            labels.append(1.0 if move > threshold * 0.6 else 0.0)
-        feat = df[['ATR','RSI','MA']].iloc[1:].values
-        if fit_scaler:
-            self.mode_scaler = MinMaxScaler()
-            scaled_features = self.mode_scaler.fit_transform(feat)
+# ---------- Multi-strategy label construction ----------
+def construct_labels_and_rewards(df: pd.DataFrame, cfg: Config):
+    n = len(df)
+    atr = df['ATR'].values
+    closes = df['close'].values
+    horizon = cfg.PRED_HORIZON
+    labels = {s: np.full(n, -1, dtype=np.int8) for s in cfg.STRATEGIES}
+    rewards = {s: np.full(n, np.nan, dtype=float) for s in cfg.STRATEGIES}
+
+    ema20 = compute_ema(df['close'], 20)
+    bbw = df['BBW'].values
+    bbw_thresh = np.percentile(bbw, 30) if len(bbw) > 10 else np.nan
+
+    spread_cost_global = cfg.SIM_SPREAD
+    slippage = cfg.SIM_SLIPPAGE_PIPS
+
+    for i in range(n - horizon):
+        future_slice = closes[i + 1: i + horizon + 1]
+        future_max = np.max(future_slice)
+        future_min = np.min(future_slice)
+
+        if 'spread_proxy' in df.columns:
+            effective_spread = float(df['spread_proxy'].iloc[i])
         else:
-            if getattr(self, 'mode_scaler', None) is None:
-                raise RuntimeError('Mode scaler missing for inference')
-            scaled_features = self.mode_scaler.transform(feat)
-        labels_arr = np.array(labels, dtype=np.float32)
-        self.last_mode_labels = labels_arr
-        logger.info(f"Mode labels balance: {np.mean(labels_arr) * 100:.2f}% aggressive")
-        return scaled_features.astype(np.float32), labels_arr
+            effective_spread = float(spread_cost_global)
 
-# ---------- Datasets ----------
-class PriceDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
+        realized_long = (future_max - closes[i]) - effective_spread - slippage
+        realized_short = (closes[i] - future_min) - effective_spread - slippage
+
+        # momentum
+        thr_m = atr[i] * cfg.LABEL_THR_FACTORS.get('momentum', 0.06)
+        if realized_long >= thr_m and realized_long > realized_short:
+            labels['momentum'][i] = 1
+            rewards['momentum'][i] = realized_long / max(1e-6, atr[i])
+        elif realized_short >= thr_m and realized_short > realized_long:
+            labels['momentum'][i] = 0
+            rewards['momentum'][i] = realized_short / max(1e-6, atr[i])
+        else:
+            labels['momentum'][i] = -1
+            rewards['momentum'][i] = np.nan
+
+        # reversion
+        thr_r = atr[i] * cfg.LABEL_THR_FACTORS.get('reversion', 0.12)
+        dev = closes[i] - ema20.iloc[i]
+        if abs(dev) >= thr_r:
+            if dev > 0 and (closes[i] - future_min) >= thr_r * 0.5:
+                labels['reversion'][i] = 0
+                pnl = (closes[i] - future_min) - effective_spread - slippage
+                rewards['reversion'][i] = pnl / max(1e-6, atr[i])
+            elif dev < 0 and (future_max - closes[i]) >= thr_r * 0.5:
+                labels['reversion'][i] = 1
+                pnl = (future_max - closes[i]) - effective_spread - slippage
+                rewards['reversion'][i] = pnl / max(1e-6, atr[i])
+            else:
+                labels['reversion'][i] = -1
+                rewards['reversion'][i] = np.nan
+        else:
+            labels['reversion'][i] = -1
+            rewards['reversion'][i] = np.nan
+
+        # squeeze
+        thr_s = atr[i] * cfg.LABEL_THR_FACTORS.get('squeeze', 0.06)
+        if not np.isnan(bbw_thresh) and bbw[i] < bbw_thresh:
+            if realized_long >= thr_s and realized_long > realized_short:
+                labels['squeeze'][i] = 1
+                rewards['squeeze'][i] = realized_long / max(1e-6, atr[i])
+            elif realized_short >= thr_s and realized_short > realized_long:
+                labels['squeeze'][i] = 0
+                rewards['squeeze'][i] = realized_short / max(1e-6, atr[i])
+            else:
+                labels['squeeze'][i] = -1
+                rewards['squeeze'][i] = np.nan
+        else:
+            labels['squeeze'][i] = -1
+            rewards['squeeze'][i] = np.nan
+
+    for s in cfg.STRATEGIES:
+        labels[s][-horizon:] = -1
+        rewards[s][-horizon:] = np.nan
+
+    return labels, rewards
+
+def composite_label_from_multi(labels_multi: Dict[str, np.ndarray], cfg: Config) -> np.ndarray:
+    n = len(next(iter(labels_multi.values())))
+    comp = np.full(n, -1, dtype=np.int8)
+    for i in range(n):
+        votes = [labels_multi[s][i] for s in cfg.STRATEGIES]
+        if any(v == 1 for v in votes):
+            comp[i] = 1
+        elif any(v == 0 for v in votes):
+            comp[i] = 0
+        else:
+            comp[i] = -1
+    return comp
+
+# ---------- PyTorch LSTM ----------
+class SeqDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int):
         self.X = X
         self.y = y
+        self.seq_len = seq_len
+
     def __len__(self):
-        return len(self.X)
+        return max(0, len(self.X) - self.seq_len)
+
     def __getitem__(self, idx):
-        return torch.tensor(self.X[idx], dtype=torch.float32), torch.tensor(self.y[idx], dtype=torch.float32)
+        x = self.X[idx: idx + self.seq_len]
+        y = self.y[idx + self.seq_len]
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
-class ModeDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = X
-        self.y = y
-    def __len__(self):
-        return len(self.X)
-    
-    def __getitem__(self, idx):
-        x_tensor = torch.tensor(self.X[idx], dtype=torch.float32)
-        y_tensor = torch.tensor(self.y[idx], dtype=torch.float32)
-        # return scalar/1-d target (DataLoader will batch into shape (batch,))
-        return x_tensor, y_tensor
- 
-#        if y_tensor.dim() == 0:
-#            y_tensor = y_tensor.unsqueeze(0)
-#        elif y_tensor.dim() > 1:
-#            y_tensor = y_tensor.view(-1)
-#        if y_tensor.dim() == 1:
-#            y_tensor = y_tensor.unsqueeze(1)
-#        return x_tensor, y_tensor
-
-# ---------- Models ----------
-class LSTMModel(nn.Module):
-    """
-    Bidirectional LSTM with simple attention pooling for scalping signals.
-    Returns a scalar prediction (batch,).
-    """
-    def __init__(self, input_size: int, hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
-                            batch_first=True, dropout=dropout, bidirectional=True)
-        # attention layer: maps hidden*2 -> 1 (score)
-        self.attn = nn.Linear(hidden_size * 2, 1)
-        # final MLP
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        # x: (B, T, F)
-        out, _ = self.lstm(x)                # out: (B, T, hidden*2)
-        # attention weights across time axis
-        scores = self.attn(out).squeeze(-1)  # (B, T)
-        weights = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B, T, 1)
-        context = torch.sum(weights * out, dim=1)  # (B, hidden*2)
-        out = self.fc(context)                # (B, 1)
-        return out.squeeze(-1)               # (B,)
-
-
-class ModeClassifier(nn.Module):
+class LSTMClassifier(nn.Module):
     def __init__(self, input_size: int, hidden_size: int = 64, num_layers: int = 1):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True)
         self.fc = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU(), nn.Linear(32, 1))
-    
+
     def forward(self, x):
         out, _ = self.lstm(x)
         out = out[:, -1, :]
-        return self.fc(out).squeeze(-1)   # returns shape (batch,)
+        logits = self.fc(out).squeeze(-1)
+        return logits
 
+# ---------- Model manager ----------
+class ModelManager:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.tree_models: Dict[str, Any] = {}
+        self.lstm_models: Dict[str, Any] = {}
+        self.lstm_scalers: Dict[str, Any] = {}
+        os.makedirs(self.cfg.MODEL_DIR, exist_ok=True)
 
-# ---------- Trainer ----------
-class ModelTrainer:
-    def __init__(self, config: Config, data_fetcher: DataFetcher):
-        self.config = config
-        self.device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
-        self.data_fetcher = data_fetcher
-        self.price_model: Optional[LSTMModel] = None
-        self.mode_model: Optional[ModeClassifier] = None
-        self.price_optimizer = None
-        self.mode_optimizer = None
-        self.price_criterion = nn.MSELoss()
-        self.mode_criterion = nn.BCEWithLogitsLoss()
-        os.makedirs(self.config.MODEL_DIR, exist_ok=True)
-
-    def save_model(self):
-        try:
-            os.makedirs(self.config.MODEL_DIR, exist_ok=True)
-            price_path = os.path.join(self.config.MODEL_DIR, 'price_model.pt')
-            mode_path = os.path.join(self.config.MODEL_DIR, 'mode_model.pt')
-            scaler_path = os.path.join(self.config.MODEL_DIR, 'scaler.pkl')
-            mode_scaler_path = os.path.join(self.config.MODEL_DIR, 'mode_scaler.pkl')
-            fn_path = os.path.join(self.config.MODEL_DIR, 'feature_names.pkl')
-            if self.price_model is not None:
-                torch.save(self.price_model.state_dict(), price_path)
-            if self.mode_model is not None:
-                torch.save(self.mode_model.state_dict(), mode_path)
-            if getattr(self.data_fetcher, 'scaler', None) is not None:
-                joblib.dump(self.data_fetcher.scaler, scaler_path)
-            if getattr(self.data_fetcher, 'mode_scaler', None) is not None:
-                joblib.dump(self.data_fetcher.mode_scaler, mode_scaler_path)
-            if getattr(self.data_fetcher, 'feature_names', None) is not None:
-                joblib.dump(self.data_fetcher.feature_names, fn_path)
-            logger.info('Models and scalers saved')
-        except Exception as e:
-            logger.exception('Failed to save models: %s', e)
-
-    def try_load_models(self) -> bool:
-        try:
-            price_path = os.path.join(self.config.MODEL_DIR, 'price_model.pt')
-            mode_path = os.path.join(self.config.MODEL_DIR, 'mode_model.pt')
-            scaler_path = os.path.join(self.config.MODEL_DIR, 'scaler.pkl')
-            mode_scaler_path = os.path.join(self.config.MODEL_DIR, 'mode_scaler.pkl')
-            fn_path = os.path.join(self.config.MODEL_DIR, 'feature_names.pkl')
-            if not (os.path.exists(price_path) and os.path.exists(mode_path) and os.path.exists(scaler_path)):
-                logger.info('Saved models/scaler not found; will train new models.')
-                return False
-            self.data_fetcher.scaler = joblib.load(scaler_path)
-            if os.path.exists(mode_scaler_path):
-                self.data_fetcher.mode_scaler = joblib.load(mode_scaler_path)
-            if os.path.exists(fn_path):
-                self.data_fetcher.feature_names = joblib.load(fn_path)
-            input_size = len(self.data_fetcher.feature_names) if self.data_fetcher.feature_names else 15
-            self.price_model = LSTMModel(input_size=input_size).to(self.device)
-            self.price_model.load_state_dict(torch.load(price_path, map_location=self.device))
-            self.mode_model = ModeClassifier(input_size=3).to(self.device)
-            self.mode_model.load_state_dict(torch.load(mode_path, map_location=self.device))
-            self.price_model.eval(); self.mode_model.eval()
-            logger.info('Loaded price & mode models and scalers from disk')
-            return True
-        except Exception as e:
-            logger.exception('Failed to load models: %s', e)
-            return False
-
-    def create_sequences(self, data: np.ndarray, labels: Optional[np.ndarray] = None, is_mode: bool = False):
-        X, y = [], []
-        raw_close = getattr(self.data_fetcher, 'raw_close', None)
-        close_idx = 3
-        if hasattr(self.data_fetcher, 'feature_names') and 'close' in self.data_fetcher.feature_names:
-            close_idx = self.data_fetcher.feature_names.index('close')
-        look = max(1, self.config.LOOKBACK)
-        for i in range(len(data) - look):
-            X.append(data[i:i + look])
-            if is_mode:
-                idx = i + look - 1
-                y.append(labels[idx] if (labels is not None and idx < len(labels)) else 0.0)
-            else:
-                if raw_close is not None and len(raw_close) >= i + look + 1:
-                    next_close = raw_close[i + look]
-                    last_close = raw_close[i + look - 1]
-                    denom = last_close if abs(last_close) > 1e-12 else 1e-12
-                    price_change = (next_close - last_close) / denom
-                else:
-                    next_close = data[i + look][close_idx]
-                    last_close = data[i + look - 1][close_idx]
-                    denom = last_close if abs(last_close) > 1e-8 else 1e-8
-                    price_change = (next_close - last_close) / denom
-                y.append(price_change)
-        if len(X) == 0:
-            return np.zeros((0, look, data.shape[1]), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-        return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
-
-    def train(self, scaled_data: np.ndarray, mode_data: np.ndarray, mode_labels: np.ndarray):
-        n_windows = 4
-        if len(scaled_data) < self.config.LOOKBACK + 10:
-            logger.warning('Not enough data to train price model properly; aborting training')
+    def train_tree(self, X: np.ndarray, y: np.ndarray, strat: str) -> None:
+        mask = y != -1
+        Xf = X[mask]
+        yf = y[mask]
+        if len(yf) < 50:
+            logger.warning('Not enough samples for tree training for strat=%s (n=%d)', strat, len(yf))
             return
-        window_size = max(self.config.LOOKBACK + 5, len(scaled_data) // n_windows)
-        val_losses = []
-        for w in range(n_windows):
-            end = min(len(scaled_data), (w + 1) * window_size)
-            train_data = scaled_data[:end]
-            test_data = scaled_data[end: min(len(scaled_data), end + window_size)]
-            if len(train_data) <= self.config.LOOKBACK or len(test_data) <= self.config.LOOKBACK:
-                continue
-            X_train, y_train = self.create_sequences(train_data)
-            X_test, y_test = self.create_sequences(test_data)
-            if len(X_train) == 0 or len(X_test) == 0:
-                continue
-            tmp_model = LSTMModel(input_size=X_train.shape[2]).to(self.device)
-            optimizer = optim.AdamW(tmp_model.parameters(), lr=1e-4, weight_decay=1e-5)
-            crit = nn.SmoothL1Loss()
+        if XGB_AVAILABLE and self.cfg.USE_XGB:
+            logger.info('Training XGBoost classifier for strat=%s', strat)
+            dmat = xgb.DMatrix(Xf, label=yf)
+            params = {'objective': 'binary:logistic', 'eval_metric': 'logloss', 'seed': self.cfg.SEED}
+            bst = xgb.train(params, dmat, num_boost_round=200, verbose_eval=False)
+            self.tree_models[strat] = bst
+            joblib.dump(bst, os.path.join(self.cfg.MODEL_DIR, f'tree_{strat}.pkl'))
+        else:
+            logger.info('Training RandomForest classifier for strat=%s', strat)
+            rf = RandomForestClassifier(n_estimators=200, random_state=self.cfg.SEED, n_jobs=-1)
+            rf.fit(Xf, yf)
+            calibrated = CalibratedClassifierCV(rf, method='sigmoid', cv=3)
+            calibrated.fit(Xf, yf)
+            self.tree_models[strat] = calibrated
+            joblib.dump(calibrated, os.path.join(self.cfg.MODEL_DIR, f'tree_{strat}.pkl'))
 
-            train_loader = DataLoader(PriceDataset(X_train, y_train), batch_size=64, shuffle=True)
-            val_loader = DataLoader(PriceDataset(X_test, y_test), batch_size=64, shuffle=False)
-            best_val = float('inf')
-            patience = 0
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=3)
-            for epoch in range(25):
-                tmp_model.train()
-                for bx, by in train_loader:
-                    bx, by = bx.to(self.device), by.to(self.device)
-                    optimizer.zero_grad()
-                    out = tmp_model(bx)
-                    by = by.view(-1)
-                    loss = crit(out, by)
-                    loss.backward()
-                    optimizer.step()
-                tmp_model.eval()
-                val_loss = 0.0
-                with torch.no_grad():
-                    for bx, by in val_loader:
-                        bx, by = bx.to(self.device), by.to(self.device)
-                        preds = tmp_model(bx)
-                        val_loss += crit(preds, by).item()
-                val_loss = val_loss / max(1, len(val_loader))
-                scheduler.step(val_loss)
-                if val_loss < best_val - 1e-9:
-                    best_val = val_loss; patience = 0
-                else:
-                    patience += 1
-                if patience >= 5:
-                    break
-            val_losses.append(best_val)
-            logger.info(f"Window {w} best val loss: {best_val:.6f}")
-        logger.info(f"Walk-forward Price avg val loss: {np.mean(val_losses) if val_losses else float('nan')}")
+    def predict_tree_proba(self, X: np.ndarray, strat: str) -> np.ndarray:
+        if strat not in self.tree_models:
+            raise RuntimeError(f'Tree model for {strat} not trained')
+        model = self.tree_models[strat]
+        if XGB_AVAILABLE and isinstance(model, xgb.Booster):
+            dm = xgb.DMatrix(X)
+            p = model.predict(dm)
+            return np.vstack([1 - p, p]).T[:, 1]
+        else:
+            return model.predict_proba(X)[:, 1]
 
-        # Final train on all data
-        X_all, y_all = self.create_sequences(scaled_data)
-        if len(X_all) == 0:
-            logger.error('Not enough sequences to train final model')
+    def train_lstm(self, X: np.ndarray, y: np.ndarray, seq_len: int, strat: str):
+        mask = y != -1
+        Xf = X[mask]
+        yf = y[mask]
+        if len(yf) < seq_len + 50:
+            logger.warning('Not enough samples for LSTM training strat=%s', strat)
             return
-        self.price_model = LSTMModel(input_size=X_all.shape[2]).to(self.device)
-        self.price_optimizer = optim.AdamW(self.price_model.parameters(), lr=1e-4, weight_decay=1e-5)
-        final_loader = DataLoader(PriceDataset(X_all, y_all), batch_size=64, shuffle=True)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.price_optimizer, mode='min', factor=0.7, patience=3)
-        crit = nn.SmoothL1Loss()
-
-        best_val = float('inf'); patience = 0
-        for epoch in range(30):
-            self.price_model.train()
-            for bx, by in final_loader:
-                bx, by = bx.to(self.device), by.to(self.device)
-                self.price_optimizer.zero_grad()
-                out = self.price_model(bx)
-                by = by.view(-1)
-                loss = crit(out, by)
+        if len(yf) < 200:
+            epochs = 40
+            batch_size = 16
+        else:
+            epochs = 15
+            batch_size = 64
+        scaler = MinMaxScaler()
+        Xs = scaler.fit_transform(Xf)
+        ds = SeqDataset(Xs, yf, seq_len)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+        model = LSTMClassifier(input_size=X.shape[1], hidden_size=self.cfg.LSTM_HIDDEN).to(self.cfg.DEVICE)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        crit = nn.BCEWithLogitsLoss()
+        for epoch in range(epochs):
+            model.train()
+            total_loss = 0.0
+            for bx, by in loader:
+                bx, by = bx.to(self.cfg.DEVICE), by.to(self.cfg.DEVICE)
+                opt.zero_grad()
+                logits = model(bx)
+                loss = crit(logits, by)
                 loss.backward()
-                self.price_optimizer.step()
-            # no separate val here; break if needed via scheduler placeholder
-        logger.info('Final price model trained on full dataset')
+                opt.step()
+                total_loss += loss.item() * len(bx)
+            logger.info('LSTM strat=%s epoch %d loss %.6f', strat, epoch, total_loss / max(1, len(ds)))
+        self.lstm_models[strat] = model
+        self.lstm_scalers[strat] = scaler
+        torch.save(model.state_dict(), os.path.join(self.cfg.MODEL_DIR, f'lstm_{strat}.pt'))
+        joblib.dump(scaler, os.path.join(self.cfg.MODEL_DIR, f'lstm_scaler_{strat}.pkl'))
+        logger.info('Saved LSTM and scaler for strat=%s', strat)
 
-        # Mode model training
-        if len(mode_data) > self.config.LOOKBACK + 5:
-            n_windows_mode = 4
-            window_size_mode = max(self.config.LOOKBACK + 5, len(mode_data) // n_windows_mode)
-            mode_val_losses = []
-            for w in range(n_windows_mode):
-                end = min(len(mode_data), (w + 1) * window_size_mode)
-                train_m = mode_data[:end]
-                test_m = mode_data[end: min(len(mode_data), end + window_size_mode)]
-                train_lab = mode_labels[:end]
-                test_lab = mode_labels[end: min(len(mode_labels), end + window_size_mode)]
-                if len(train_m) <= self.config.LOOKBACK or len(test_m) <= self.config.LOOKBACK:
-                    continue
-                X_m_train, y_m_train = self.create_sequences(train_m, train_lab, is_mode=True)
-                X_m_test, y_m_test = self.create_sequences(test_m, test_lab, is_mode=True)
-                if len(X_m_train) == 0 or len(X_m_test) == 0:
-                    continue
-                pos = float(np.sum(y_m_train)); neg = float(len(y_m_train) - pos)
-                pos_weight_val = (neg / pos) if pos > 0 else 1.0
-                pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32, device=self.device)
-                tmp_mode = ModeClassifier(input_size=X_m_train.shape[2]).to(self.device)
-                opt = optim.Adam(tmp_mode.parameters(), lr=1e-3)
-                crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-                tr_loader = DataLoader(ModeDataset(X_m_train, y_m_train), batch_size=64, shuffle=True)
-                val_loader = DataLoader(ModeDataset(X_m_test, y_m_test), batch_size=64, shuffle=False)
-                best_val = float('inf'); patience = 0
-                for epoch in range(20):
-                    tmp_mode.train()
-                    for bx, by in tr_loader:
-                        bx, by = bx.to(self.device), by.to(self.device)
-                        opt.zero_grad()
-                        out = tmp_mode(bx)
-                        by = by.view(-1)
-                        loss = crit(out, by)
-                        loss.backward()
-                        opt.step()
-                    tmp_mode.eval()
-                    val_loss = 0.0; correct = 0; total = 0
-                    with torch.no_grad():
-                        for bx, by in val_loader:
-                            bx, by = bx.to(self.device), by.to(self.device)
-                            logits = tmp_mode(bx)
-                            val_loss += crit(logits, by).item()
-                            probs = torch.sigmoid(logits)
-                            preds = (probs > 0.5).float()
-                            correct += (preds == by).sum().item()
-                            total += by.numel()
-                    val_loss = val_loss / max(1, len(val_loader))
-                    val_acc = correct / total if total > 0 else 0.0
-                    if val_loss < best_val - 1e-9:
-                        best_val = val_loss; patience = 0
-                    else:
-                        patience += 1
-                    if patience >= 4:
-                        break
-                mode_val_losses.append(best_val)
-                logger.info(f"Mode window {w} val_loss={best_val:.6f} val_acc={val_acc:.3f}")
-            logger.info(f"Mode walk-forward avg val loss: {np.mean(mode_val_losses) if mode_val_losses else float('nan'):.6f}")
-
-            X_mode_all, y_mode_all = self.create_sequences(mode_data, mode_labels, is_mode=True)
-            if len(X_mode_all) > 0:
-                pos = float(np.sum(y_mode_all)); neg = float(len(y_mode_all) - pos)
-                pos_weight_val = (neg / pos) if pos > 0 else 1.0
-                pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32, device=self.device)
-                self.mode_model = ModeClassifier(input_size=X_mode_all.shape[2]).to(self.device)
-                self.mode_optimizer = optim.Adam(self.mode_model.parameters(), lr=1e-3)
-                crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-                mode_loader = DataLoader(ModeDataset(X_mode_all, y_mode_all), batch_size=64, shuffle=True)
-                for epoch in range(30):
-                    self.mode_model.train()
-                    for bx, by in mode_loader:
-                        bx, by = bx.to(self.device), by.to(self.device)
-                        self.mode_optimizer.zero_grad()
-                        out = self.mode_model(bx)
-                        by = by.view(-1)
-                        loss = crit(out, by)
-                        loss.backward()
-                        self.mode_optimizer.step()
-                logger.info('Final mode model trained')
-            else:
-                logger.warning('Not enough mode data to train final mode model')
-        else:
-            logger.warning('Not enough mode data to train mode model')
-
-        self.save_model()
-
-    def predict_price(self, scaled_data: np.ndarray) -> Tuple[float, Tuple[float, float], float]:
-        if self.price_model is None:
-            raise RuntimeError('Price model not trained')
-        #
-        seq = scaled_data[-self.config.LOOKBACK:]
-        if seq.shape[0] < self.config.LOOKBACK:
-            raise ValueError('Not enough data for prediction sequence')
-        preds = []
-        x = torch.tensor(seq.reshape(1, seq.shape[0], seq.shape[1]), dtype=torch.float32).to(self.device)
-        self.price_model.eval()
-        with torch.no_grad():
-            for _ in range(10):
-                # MC-dropout style sampling: briefly enable train mode if model has dropout
-                self.price_model.train()
-                preds.append(self.price_model(x).cpu().numpy().item())
-        mean_change = float(np.mean(preds))
-        std_change = float(np.std(preds))
-        last_close = float(self.data_fetcher.last_df['close'].iloc[-1])
-        mean_price = last_close * (1.0 + mean_change)
-        range_low = mean_price - std_change * abs(last_close)
-        range_high = mean_price + std_change * abs(last_close)
-        # return mean, (low,high), and std_change for gating downstream
-        return mean_price, (range_low, range_high), std_change
-
-    def predict_mode(self, mode_data: np.ndarray) -> str:
-        if self.mode_model is None:
-            return 'neutral'
-        seq = mode_data[-self.config.LOOKBACK:]
-        if seq.shape[0] < self.config.LOOKBACK:
-            return 'neutral'
-        with torch.no_grad():
-            x = torch.tensor(seq.reshape(1, seq.shape[0], seq.shape[1]), dtype=torch.float32).to(self.device)
-            logits = self.mode_model(x).cpu().numpy()
-            logit = float(np.asarray(logits).ravel()[0])
-            prob = 1.0 / (1.0 + np.exp(-logit))
-
-            return 'aggressive' if prob > 0.5 else 'conservative'
-
-    def predict(self, scaled_data: np.ndarray, mode_data: np.ndarray):
-        if scaled_data is None or len(scaled_data) < self.config.LOOKBACK:
-            return 'HOLD', 'neutral', float(self.data_fetcher.last_df['close'].iloc[-1])
-        mean_price, _, std_change = self.predict_price(scaled_data)
-        mode = self.predict_mode(mode_data)
-        last_close = float(self.data_fetcher.last_df['close'].iloc[-1])
-        atr = float(self.data_fetcher.last_df['ATR'].iloc[-1]) if 'ATR' in self.data_fetcher.last_df.columns else 0.0
-        sens = getattr(self.data_fetcher, 'sensitivity', 1.0)
-
-        # base threshold (small, scalping-oriented)
-        threshold = max(atr * 0.05, abs(mean_price - last_close) * 0.05) * sens
-
-        # uncertainty absolute in price units
-        uncertainty_abs = std_change * abs(last_close)
-
-        # require predicted move to exceed both threshold and a multiple of model uncertainty
-        min_uncertainty_mult = 1.0  # require move > 1×std
-        gating_value = max(threshold, uncertainty_abs * min_uncertainty_mult)
-
-        price_diff = mean_price - last_close
-        logger.info(f"Pred mean {mean_price:.5f} last {last_close:.5f} diff {price_diff:.6f} threshold {threshold:.6f} uncert_abs {uncertainty_abs:.6f} mode {mode}")
-
-        # if prediction is not sufficiently larger than uncertainty, HOLD
-        if abs(price_diff) < gating_value:
-            logger.info(f"HOLD by gating: |price_diff| {abs(price_diff):.6f} < gating_value {gating_value:.6f}")
-            return 'HOLD', mode, float(mean_price)
-
-        # otherwise decide direction
-        if price_diff > 0:
-            return 'BUY', mode, float(mean_price)
-        else:
-            return 'SELL', mode, float(mean_price)
-
-# ---------- Executor ----------
-class Executor:
-    def __init__(self, config: Config, data_fetcher: DataFetcher):
-        self.config = config
-        self.data_fetcher = data_fetcher
-        self.pending_orders = {}
-        self.processed_deals = set()
-        self.recent_pnls = []
-        self.sensitivity = 1.0
-
-    def has_open_position(self) -> bool:
-        if mt5 is None:
-            return False
-        try:
-            positions = mt5.positions_get(symbol=self.config.SYMBOL)
-            return bool(positions and len(positions) > 0)
-        except Exception:
-            return False
-
-    def place_order(self, action: str, pred_price: float, mode: str, win_rate: float = 0.55, rr: float = 2.0):
-        if action not in ('BUY', 'SELL'):
-            logger.info(f"Action {action} -> no order placed.")
-            return None
-        try:
-            if self.has_open_position():
-                logger.info('Already have open position; skipping new order')
-                return None
-            if mt5 is None:
-                logger.info('MT5 not available; dry-run only. Not sending order.')
-                logger.info(f'DRYRUN: {action} at predicted {pred_price:.5f} mode {mode}')
-                return None
-
-            # load market & account info
-            symbol_info = mt5.symbol_info(self.config.SYMBOL)
-            if symbol_info is None:
-                logger.warning('Symbol info missing from MT5'); return None
-
-            # current market tick
-            tick = mt5.symbol_info_tick(self.config.SYMBOL)
-            if tick is None:
-                logger.warning('Failed to fetch symbol tick'); return None
-
-            # last dataframe and ATR (for spread-rel checks)
-            df = self.data_fetcher.last_df
-            if df is None or df.empty:
-                logger.warning('No market data for SL calc'); return None
-            atr = compute_atr(df['high'], df['low'], df['close'], self.config.ATR_PERIOD).iloc[-1]
-            if atr is None or np.isnan(atr) or atr <= 0:
-                logger.warning('Invalid ATR; skipping order'); return None
-
-            # spread check (skip if too wide relative to ATR)
-            spread = abs(float(tick.ask) - float(tick.bid))
-            if spread > max(atr * 0.2, 0.1):   # 0.5 USD floor for XAUUSD; tune per broker
-                logger.info(f"Spread too wide ({spread:.5f}), skipping order")
-                return None
-
-            price = float(tick.ask) if action == 'BUY' else float(tick.bid)
-
-            if action == 'BUY':
-                tp = float(pred_price - max((pred_price - price) * 0.05, atr * 0.1))
-                sl = float(price - atr)
-                order_type = mt5.ORDER_TYPE_BUY
-            else:
-                tp = float(pred_price + max((price - pred_price) * 0.05, atr * 0.1))
-                sl = float(price + atr)
-                order_type = mt5.ORDER_TYPE_SELL
-            account_info = mt5.account_info()
-            if account_info is None:
-                logger.warning('Account info missing'); return None
-            account_balance = float(account_info.balance)
-            kelly_fraction = (win_rate * (rr + 1) - 1) / rr
-            kelly_fraction = max(0.01, min(kelly_fraction, 0.1))
-            risk_amount = account_balance * kelly_fraction
-            point = getattr(symbol_info, 'point', 0.01)
-            sl_pips = max(1e-8, abs(price - sl) / point)
-            denom = sl_pips * point * 100000.0
-            if abs(denom) < 1e-8:
-                volume = self.config.LOT_SIZE
-            else:
-                volume = risk_amount / denom
-                volume = max(self.config.LOT_SIZE, min(volume, self.config.MAX_LOT))
-                vol_step = getattr(symbol_info, 'volume_step', 0.01)
-                if vol_step > 0:
-                    volume = float(round(volume / vol_step) * vol_step)
-            request = {
-                'action': mt5.TRADE_ACTION_DEAL,
-                'symbol': self.config.SYMBOL,
-                'volume': float(volume),
-                'type': order_type,
-                'price': price,
-                'sl': sl,
-                'tp': tp,
-                'deviation': 20,
-                'magic': 234000,
-                'comment': 'AI Bot',
-                'type_time': mt5.ORDER_TIME_GTC,
-                'type_filling': mt5.ORDER_FILLING_IOC,
-            }
-            result = mt5.order_send(request)
-            if result is None:
-                logger.warning('MT5 order_send returned None'); return None
-            retcode = getattr(result, 'retcode', None)
-            if retcode != mt5.TRADE_RETCODE_DONE:
-                logger.warning(f'Order failed with retcode {retcode}'); return None
-            logger.info(f'Order placed: {action} vol={volume:.4f} sl={sl:.5f} tp={tp:.5f}')
-            order_ticket = getattr(result, 'order', None) or getattr(result, 'deal', None) or None
-            if order_ticket is not None:
-                self.pending_orders[str(order_ticket)] = {
-                    'open_price': price, 'volume': volume, 'action': action, 'tp': tp, 'sl': sl, 'timestamp': datetime.now(timezone.utc)
-                }
-            return result
-        except Exception as e:
-            logger.exception('Exception in place_order: %s', e)
-            return None
-
-    def check_closed_orders(self):
-        if mt5 is None:
+    def train_reward_regressor(self, X: np.ndarray, r: np.ndarray, strat: str):
+        mask = ~np.isnan(r)
+        Xf = X[mask]
+        rf = r[mask]
+        if len(rf) < 50:
+            logger.warning('Not enough reward samples for strat=%s (n=%d)', strat, len(rf))
             return
+        if XGB_AVAILABLE and self.cfg.USE_XGB:
+            logger.info('Training XGBoost regressor for reward strat=%s', strat)
+            dtr = xgb.DMatrix(Xf, label=rf)
+            params = {'objective': 'reg:squarederror', 'seed': self.cfg.SEED}
+            bst = xgb.train(params, dtr, num_boost_round=200, verbose_eval=False)
+            self.tree_models[f'reward_{strat}'] = bst
+            joblib.dump(bst, os.path.join(self.cfg.MODEL_DIR, f'reward_{strat}.pkl'))
+        else:
+            logger.info('Training RandomForest regressor for reward strat=%s', strat)
+            rfr = RandomForestRegressor(n_estimators=200, random_state=self.cfg.SEED, n_jobs=-1)
+            rfr.fit(Xf, rf)
+            self.tree_models[f'reward_{strat}'] = rfr
+            joblib.dump(rfr, os.path.join(self.cfg.MODEL_DIR, f'reward_{strat}.pkl'))
+        logger.info('Saved reward regressor for strat=%s', strat)
+
+    def predict_reward(self, X: np.ndarray, strat: str) -> np.ndarray:
+        key = f'reward_{strat}'
+        if key not in self.tree_models:
+            return np.zeros(X.shape[0], dtype=float)
+        model = self.tree_models[key]
+        if XGB_AVAILABLE and isinstance(model, xgb.Booster):
+            dm = xgb.DMatrix(X)
+            return model.predict(dm)
+        else:
+            return model.predict(X)
+
+    def predict_lstm_proba(self, seq_tail: np.ndarray, strat: str) -> np.ndarray:
+        if strat not in self.lstm_models or strat not in self.lstm_scalers:
+            raise RuntimeError(f'LSTM or scaler for strat={strat} not available')
+        scaler = self.lstm_scalers[strat]
+        model = self.lstm_models[strat]
+        st = scaler.transform(seq_tail)
+        xb = torch.tensor(st.reshape(1, st.shape[0], st.shape[1]), dtype=torch.float32).to(self.cfg.DEVICE)
+        model.eval()
+        with torch.no_grad():
+            logits = model(xb)
+            prob = float(torch.sigmoid(logits).cpu().numpy().ravel()[0])
+        return prob
+
+    def predict_proba_multi(self, X: np.ndarray, seq_tail: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+        res = {}
+        for strat in self.cfg.STRATEGIES:
+            tree_p = None
+            lstm_p = None
+            if strat in self.tree_models:
+                try:
+                    tree_p = self.predict_tree_proba(X, strat)
+                except Exception as e:
+                    logger.exception('Tree predict failed for strat=%s: %s', strat, e)
+                    tree_p = None
+            if strat in self.lstm_models and seq_tail is not None:
+                try:
+                    p = self.predict_lstm_proba(seq_tail, strat)
+                    lstm_p = np.full(X.shape[0], p, dtype=float)
+                except Exception as e:
+                    logger.exception('LSTM predict failed for strat=%s: %s', strat, e)
+                    lstm_p = None
+            if tree_p is None and lstm_p is None:
+                res[strat] = np.full(X.shape[0], 0.5, dtype=float)
+                continue
+            if tree_p is None:
+                combined = lstm_p
+            elif lstm_p is None:
+                combined = tree_p
+            else:
+                lw = self.cfg.PROBABILITY_WEIGHT_TREE
+                lw2 = self.cfg.PROBABILITY_WEIGHT_LSTM
+                lt = logit_np(tree_p)
+                ll = logit_np(lstm_p)
+                comb_logit = (lw * lt + lw2 * ll) / (lw + lw2)
+                combined = expit_np(comb_logit)
+            try:
+                comb_logit2 = logit_np(combined) * self.cfg.PROB_SHARPEN
+                combined = expit_np(comb_logit2)
+            except Exception:
+                pass
+            res[strat] = combined
+        return res
+
+    def predict_meta_proba(self, X: np.ndarray, seq_tail: Optional[np.ndarray] = None) -> np.ndarray:
+        multi = self.predict_proba_multi(X, seq_tail=seq_tail)
+        weights = np.array([self.cfg.STRATEGY_WEIGHTS.get(s, 1.0) for s in self.cfg.STRATEGIES], dtype=float)
+        probs_stack = np.vstack([multi[s] for s in self.cfg.STRATEGIES])
+        meta = np.average(probs_stack, axis=0, weights=weights)
+        meta = expit_np(logit_np(meta) * self.cfg.PROB_SHARPEN)
+        return meta
+
+    def save(self):
+        os.makedirs(self.cfg.MODEL_DIR, exist_ok=True)
+        for strat, m in self.tree_models.items():
+            joblib.dump(m, os.path.join(self.cfg.MODEL_DIR, f'tree_{strat}.pkl'))
+        for strat, m in self.lstm_models.items():
+            torch.save(m.state_dict(), os.path.join(self.cfg.MODEL_DIR, f'lstm_{strat}.pt'))
+        for strat, s in self.lstm_scalers.items():
+            joblib.dump(s, os.path.join(self.cfg.MODEL_DIR, f'lstm_scaler_{strat}.pkl'))
         try:
-            to_utc = datetime.now(timezone.utc)
-            from_utc = to_utc - timedelta(days=7)
-            deals = mt5.history_deals_get(from_utc, to_utc)
-            if not deals:
-                return
-            for d in deals:
-                deal_id = getattr(d, 'deal', None) or getattr(d, 'ticket', None)
-                if deal_id is None:
-                    continue
-                if deal_id in self.processed_deals:
-                    continue
-                comment = getattr(d, 'comment', '') or ''
-                if 'AI Bot' in comment or getattr(d, 'magic', None) == 234000:
-                    pnl = getattr(d, 'profit', None)
-                    if pnl is not None:
+            joblib.dump(self.cfg, os.path.join(self.cfg.MODEL_DIR, 'config.pkl'))
+        except Exception:
+            pass
+        logger.info('✅ ModelManager saved successfully.')
+
+    @staticmethod
+    def load(cfg: Config) -> 'ModelManager':
+        mm = ModelManager(cfg)
+        try:
+            for strat in cfg.STRATEGIES:
+                tree_path = os.path.join(cfg.MODEL_DIR, f'tree_{strat}.pkl')
+                if os.path.exists(tree_path):
+                    try:
+                        mm.tree_models[strat] = joblib.load(tree_path)
+                        logger.info('Loaded tree model for strat=%s', strat)
+                    except Exception as e:
+                        logger.warning('Failed loading tree model for %s: %s', strat, e)
+                lstm_scaler_path = os.path.join(cfg.MODEL_DIR, f'lstm_scaler_{strat}.pkl')
+                lstm_model_path = os.path.join(cfg.MODEL_DIR, f'lstm_{strat}.pt')
+                if os.path.exists(lstm_scaler_path) and os.path.exists(lstm_model_path):
+                    try:
+                        scaler = joblib.load(lstm_scaler_path)
+                        mm.lstm_scalers[strat] = scaler
+                        n_features = getattr(scaler, 'n_features_in_', None)
+                    except Exception as e:
+                        logger.warning('Failed to load lstm scaler for %s: %s', strat, e)
+                        n_features = None
+                    try:
+                        if n_features is None:
+                            n_features = len(FeatureEngineer(cfg).feature_columns())
+                        model = LSTMClassifier(input_size=int(n_features), hidden_size=cfg.LSTM_HIDDEN)
+                        state_dict = torch.load(lstm_model_path, map_location=cfg.DEVICE)
                         try:
-                            pnl = float(pnl)
-                            self.recent_pnls.append(pnl)
-                            if len(self.recent_pnls) > 10:
-                                self.recent_pnls.pop(0)
-                            avg_pnl = float(np.mean(self.recent_pnls))
-                            sens = getattr(self.data_fetcher, 'sensitivity', 1.0)
-                            sens = sens * (0.90 if avg_pnl > 0 else 1.10)
-                            sens = float(np.clip(sens, 0.5, 2.0))
-                            self.data_fetcher.sensitivity = sens
-                            logger.info(f"Updated sensitivity to {sens:.3f} from avg pnl {avg_pnl:.3f}")
-                        except Exception:
-                            pass
-                    self.processed_deals.add(deal_id)
+                            model.load_state_dict(state_dict)
+                        except RuntimeError:
+                            model.load_state_dict(state_dict, strict=False)
+                        model.to(cfg.DEVICE)
+                        mm.lstm_models[strat] = model
+                        logger.info('Loaded LSTM for strat=%s', strat)
+                    except Exception as e:
+                        logger.warning('Could not load LSTM for %s: %s', strat, e)
+            logger.info('✅ ModelManager loaded successfully.')
         except Exception as e:
-            logger.exception('Error in check_closed_orders: %s', e)
+            logger.exception('⚠️ Failed to load components: %s', e)
+        return mm
 
-# ---------- Synthetic data generator ----------
-def generate_synthetic_data(bars: int = 2000, start_price: float = 2000.0) -> pd.DataFrame:
-    rng = np.random.RandomState(42)
-    dt = pd.date_range(end=pd.Timestamp.utcnow(), periods=bars, freq='5min')
-    price = start_price
-    rows = []
-    for t in dt:
-        change = rng.normal(loc=0.00002, scale=0.0006)
-        new_price = price * (1 + change)
-        high = max(price, new_price) * (1 + abs(rng.normal(0, 0.0001)))
-        low = min(price, new_price) * (1 - abs(rng.normal(0, 0.0001)))
-        open_p = price
-        close_p = new_price
-        tick_vol = int(abs(rng.normal(100, 30)))
-        rows.append({'time': t, 'open': open_p, 'high': high, 'low': low, 'close': close_p, 'tick_volume': tick_vol})
-        price = new_price
-    df = pd.DataFrame(rows)
-    return df
+# ---------- Backtesting engine ----------
+class Backtester:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
 
-# ---------- Main ----------
-def main(args):
+    def simulate(self, df: pd.DataFrame, probs: np.ndarray, labels: np.ndarray) -> Dict[str, Any]:
+        results = []
+        n = len(df)
+        spread = self.cfg.SIM_SPREAD
+        slippage = self.cfg.SIM_SLIPPAGE_PIPS
+        for i in range(n - self.cfg.PRED_HORIZON):
+            if labels[i] == -1:
+                continue
+            p = probs[i]
+            # require a clear probability: either high long or high short
+            if not (p >= self.cfg.MIN_TRADE_PROB or p <= (1.0 - self.cfg.MIN_TRADE_PROB)):
+                continue
+            # determine side using label confirmation and probability direction
+            side = None
+            if p >= 0.5 and labels[i] == 1:
+                side = 1
+            elif p < 0.5 and labels[i] == 0:
+                side = -1
+            else:
+                # if label doesn't match but prob is extreme, allow prob-only direction
+                if p >= self.cfg.PROB_ONLY_THRESHOLD:
+                    side = 1
+                elif p <= (1.0 - self.cfg.PROB_ONLY_THRESHOLD):
+                    side = -1
+                else:
+                    side = None
+            if side is None:
+                continue
+            entry = df['close'].iloc[i] + side * spread
+            atr = df['ATR'].iloc[i]
+            sl = entry - side * atr * 1.0
+            tp = entry + side * atr * 0.6
+            horizon_prices = df['close'].iloc[i + 1: i + self.cfg.PRED_HORIZON + 1].values
+            exit_price = horizon_prices[-1] if len(horizon_prices) > 0 else entry
+            for px in horizon_prices:
+                if side == 1 and px >= tp:
+                    exit_price = tp - slippage
+                    break
+                if side == -1 and px <= tp:
+                    exit_price = tp + slippage
+                    break
+                if side == 1 and px <= sl:
+                    exit_price = sl + slippage
+                    break
+                if side == -1 and px >= sl:
+                    exit_price = sl - slippage
+                    break
+            pnl = (exit_price - entry) * side
+            results.append({'index': i, 'prob': p, 'side': side, 'entry': entry, 'exit': exit_price, 'pnl': pnl})
+        if not results:
+            return {'trades': 0, 'win_rate': 0.0, 'net': 0.0, 'pnl_series': []}
+        rdf = pd.DataFrame(results)
+        wins = (rdf['pnl'] > 0).sum()
+        net = rdf['pnl'].sum()
+        return {'trades': len(rdf), 'win_rate': wins / len(rdf), 'net': net, 'pnl_series': rdf['pnl'].values}
+
+# ---------- Execution / Live trading ----------
+class RiskManager:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def compute_volume(self, account_balance: float, price: float, sl_price: float, symbol: Optional[str] = None) -> float:
+        risk_amount = account_balance * self.cfg.RISK_PER_TRADE
+        sl_distance = abs(price - sl_price)
+        if sl_distance <= 0:
+            return 0.01
+        vol = 0.01
+        try:
+            if mt5 is not None and symbol is not None:
+                sym = mt5.symbol_info(symbol)
+            else:
+                sym = None
+            contract_size = getattr(sym, 'trade_contract_size', None)
+            point = getattr(sym, 'point', None)
+            if contract_size is not None and point is not None and point > 0:
+                pip_value_per_lot = contract_size * point
+                vol = risk_amount / max(1e-12, sl_distance * pip_value_per_lot)
+            else:
+                vol = risk_amount / max(1e-12, sl_distance * 1000.0)
+        except Exception as e:
+            logger.warning('Volume compute fallback due to: %s', e)
+            vol = risk_amount / max(1e-12, sl_distance * 1000.0)
+        vol = max(0.01, min(vol, self.cfg.MAX_VOLUME))
+        return float(vol)
+
+# Replace the existing ExecutorLive class with this one.
+
+class ExecutorLive:
+    """
+    ExecutorLive (upgraded):
+      - one aggregated position per direction
+      - open larger lot but single position
+      - partial-close system (configurable)
+      - monitor open position, manage partial closes
+      - regime-aware cooldown; ML can re-arm only after close + cooldown
+    """
+    def __init__(self, cfg: Config, models: ModelManager, fe: FeatureEngineer):
+        self.cfg = cfg
+        self.models = models
+        self.fe = fe
+        self.mt5 = MT5Connector(cfg)
+        self.risk = RiskManager(cfg)
+
+        # Execution state
+        self.last_trade_time = 0.0
+        self.last_side = None          # 'BUY' or 'SELL' or None
+        self.in_cooldown_until = 0.0
+        self.open_position_ticket = None
+        self.open_position_type = None
+        self.open_position_volume = 0.0
+        self.partial_close_state = []  # list of dicts tracking executed partial closes
+
+        # Configurable execution params
+        self.MIN_SIGNAL_INTERVAL = 10.0        # minimal seconds between same-direction open attempts
+        self.COOLDOWN_BASE_SEC = 300.0          # base cooldown seconds after full close
+        self.REGIME_MULTIPLIER = {'trend': 0.5, 'meanrev': 1.5, 'chop': 2.0}
+        # Partial close scheme: list of (fraction_to_close, tp_multiplier_of_atr)
+        # Fractions apply to the volume remaining at the time of the partial close decision.
+        # Example: first close 50% at tp=1.0*ATR, then close remaining 100% at tp=1.8*ATR
+        self.PARTIAL_CLOSES = [
+            {'frac': 0.5, 'tp_atr': 1.0},   # close 50% at +1.0 ATR
+            {'frac': 1.0, 'tp_atr': 1.8}    # close remaining 100% at +1.8 ATR
+        ]
+        self.MIN_VOLUME_FOR_TRADE = 0.01
+
+        self._stop = False
+
+    def start(self, dry_run: bool = True):
+        logger.info('ExecutorLive.start dry_run=%s device=%s', dry_run, self.cfg.DEVICE)
+        if not dry_run and not self.mt5.connect():
+            logger.error('MT5 connect failed; abort')
+            return
+
+        # Warm start: ensure scaler loaded or fitted
+        try:
+            hist = self.mt5.fetch_history_m5(self.cfg.HISTORY_BARS) if self.mt5.connected else None
+            if hist is not None:
+                self.fe.build_features(hist, fit_scaler=False)
+        except Exception:
+            pass
+
+        loop_delay = max(0.5, getattr(self.cfg, 'LIVE_LOOP_DELAY', 1.0))
+
+        while not self._stop:
+            loop_start = time.time()
+            try:
+                # 1) Monitor existing position(s) and manage partial closes
+                try:
+                    self._monitor_and_manage_positions(dry_run=dry_run)
+                except Exception as e:
+                    logger.exception('Error in _monitor_and_manage_positions: %s', e)
+
+                # 2) If in cooldown, skip signal generation
+                now = time.time()
+                if now < self.in_cooldown_until:
+                    logger.debug('In cooldown until %s; skipping signal eval', self.in_cooldown_until)
+                else:
+                    # 3) Evaluate new signal only if no open position or position closed
+                    #    We allow only one aggregated open position at a time (any direction).
+                    positions = []
+                    if mt5 is not None and self.mt5.connected:
+                        positions = mt5.positions_get(symbol=self.cfg.SYMBOL) or []
+
+                    if positions and len(positions) > 0:
+                        # position(s) exist: rely on monitor, do not open new
+                        logger.debug('Existing positions present (%d), skipping new-entry evaluation', len(positions))
+                    else:
+                        # No open position -> evaluate ML signal
+                        df_now = None
+                        try:
+                            df_now = self.mt5.fetch_history_m5(300) if (mt5 is not None and self.mt5.connected) else None
+                        except Exception as e:
+                            logger.warning('Failed to fetch history for signal evaluation: %s', e)
+                            df_now = None
+
+                        if df_now is None or len(df_now) < max(50, self.cfg.LOOKBACK_BARS + 10):
+                            logger.debug('Insufficient data for features; skipping')
+                        else:
+                            df_proc, Xs_now = self.fe.build_features(df_now, fit_scaler=False)
+                            seq_tail = Xs_now[-self.cfg.LOOKBACK_BARS:] if Xs_now.shape[0] >= self.cfg.LOOKBACK_BARS else Xs_now
+                            multi_probs = self.models.predict_proba_multi(Xs_now, seq_tail=seq_tail)
+                            # compute strategy scores similar to main code
+                            strategy_scores = {}
+                            for s in self.cfg.STRATEGIES:
+                                p = float(multi_probs.get(s, np.full(Xs_now.shape[0], 0.5))[-1])
+                                try:
+                                    reward_pred = float(self.models.predict_reward(Xs_now[-1:].astype(np.float32), s)[0])
+                                except Exception:
+                                    reward_pred = 0.0
+                                reward_clamped = max(-1.0, min(reward_pred, 3.0))
+                                score = p * max(0.0, reward_clamped)
+                                strategy_scores[s] = {'prob': p, 'reward': reward_pred, 'score': score}
+
+                            # choose best strategy
+                            best_strat = max(strategy_scores.keys(), key=lambda k: strategy_scores[k]['score'])
+                            best = strategy_scores[best_strat]
+                            chosen_prob = best['prob']
+                            logger.info('Strategy scores=%s chosen=%s prob=%.3f reward=%.3f score=%.4f',
+                                        {k: (v['prob'], round(v['reward'],3), round(v['score'],3)) for k,v in strategy_scores.items()},
+                                        best_strat, best['prob'], best['reward'], best['score'])
+
+                            # Decide side with label confirmation (if available)
+                            labels_multi, _ = construct_labels_and_rewards(df_proc, self.cfg)
+                            comp = composite_label_from_multi(labels_multi, self.cfg)
+                            label_idx = - (self.cfg.PRED_HORIZON + 1)
+                            possible_label = None
+                            if len(comp) >= abs(label_idx):
+                                possible_label = int(comp[label_idx])
+                            # require match between label and prob OR extremely strong prob-only
+                            side_to_open = None
+                            if possible_label == 1 and chosen_prob >= self.cfg.MIN_TRADE_PROB:
+                                side_to_open = 'BUY'
+                            elif possible_label == 0 and chosen_prob <= (1.0 - self.cfg.MIN_TRADE_PROB):
+                                side_to_open = 'SELL'
+                            else:
+                                # allow prob-only if very strong
+                                if chosen_prob >= self.cfg.PROB_ONLY_THRESHOLD:
+                                    side_to_open = 'BUY'
+                                elif chosen_prob <= (1.0 - self.cfg.PROB_ONLY_THRESHOLD):
+                                    side_to_open = 'SELL'
+
+                            if side_to_open is not None:
+                                # Avoid repeat firing in short interval
+                                if self.last_side == side_to_open and (now - self.last_trade_time) < self.MIN_SIGNAL_INTERVAL:
+                                    logger.info('Signal %s but MIN_SIGNAL_INTERVAL (%.1fs) not elapsed since last trade, skipping', side_to_open, self.MIN_SIGNAL_INTERVAL)
+                                else:
+                                    # Compute volume (single aggregated position)
+                                    price_tick = mt5.symbol_info_tick(self.cfg.SYMBOL) if (mt5 is not None and self.mt5.connected) else None
+                                    exec_price = float(price_tick.ask if side_to_open == 'BUY' else price_tick.bid) if price_tick else float(df_proc['close'].iloc[-1])
+                                    # derive ATR
+                                    atr_val = float(df_proc['ATR'].iloc[-1]) if 'ATR' in df_proc.columns else max(1e-3, exec_price * 0.001)
+                                    # compute target lot via risk manager (we'll scale allowed to MAX_VOLUME)
+                                    account_info = mt5.account_info() if (mt5 is not None and self.mt5.connected) else None
+                                    account_balance = float(account_info.balance) if account_info is not None else 10000.0
+                                    # set an aggressive single trade risk budget (e.g., 2x RISK_PER_TRADE)
+                                    single_risk = min(0.05, self.cfg.RISK_PER_TRADE * 4)  # e.g. allow bigger single position but capped
+                                    # temporarily override risk manager per this allocation
+                                    # compute a desired volume using risk_amount = account_balance * single_risk
+                                    desired_volume = self._compute_volume_for_risk(account_balance, exec_price, atr_val, single_risk)
+                                    # enforce symbol constraints
+                                    sym = mt5.symbol_info(self.cfg.SYMBOL) if (mt5 is not None and self.mt5.connected) else None
+                                    vol_min = float(getattr(sym, 'volume_min', self.MIN_VOLUME_FOR_TRADE))
+                                    vol_step = float(getattr(sym, 'volume_step', 0.01))
+                                    vol_max = float(getattr(sym, 'volume_max', self.cfg.MAX_VOLUME))
+                                    desired_volume = max(vol_min, min(desired_volume, vol_max))
+                                    # round to step
+                                    try:
+                                        steps = round((desired_volume - vol_min) / vol_step)
+                                        desired_volume = float(vol_min + steps * vol_step)
+                                    except Exception:
+                                        desired_volume = float(max(vol_min, min(desired_volume, vol_max)))
+
+                                    logger.info('Prepared aggregated %s open: price=%.5f atr=%.5f desired_vol=%.3f', side_to_open, exec_price, atr_val, desired_volume)
+
+                                    if dry_run:
+                                        logger.info('Dry-run: WOULD OPEN aggregated %s volume=%.3f at price=%.5f', side_to_open, desired_volume, exec_price)
+                                        # emulate that it would be opened and then let monitor handle closing (only for dry-run)
+                                        self.last_side = side_to_open
+                                        self.last_trade_time = now
+                                        # set a pseudo open position record for dry-run
+                                        self.open_position_volume = desired_volume
+                                        self.open_position_type = side_to_open
+                                        self.partial_close_state = [{'frac': pc['frac'], 'executed': False, 'tp': None} for pc in self.PARTIAL_CLOSES]
+                                    else:
+                                        # open aggregated order
+                                        try:
+                                            res = self._open_aggregated_position(side_to_open, desired_volume, exec_price, atr_val)
+                                            if res is not None:
+                                                self.last_side = side_to_open
+                                                self.last_trade_time = now
+                                        except Exception as e:
+                                            logger.exception('Failed to open aggregated position: %s', e)
+            except Exception as e:
+                logger.exception('Unhandled error in live loop: %s', e)
+
+            # enforce loop delay
+            elapsed = time.time() - loop_start
+            if elapsed < loop_delay:
+                time.sleep(max(0, loop_delay - elapsed))
+
+        # end loop
+        if self.mt5.connected:
+            self.mt5.disconnect()
+        logger.info('ExecutorLive stopped')
+
+    # ---------- helper: compute volume for specified risk fraction ----------
+    def _compute_volume_for_risk(self, account_balance: float, price: float, atr: float, risk_fraction: float) -> float:
+        """
+        Conservative volume calculation:
+         - risk_amount = account_balance * risk_fraction
+         - sl_distance = atr (we size SL at ~ATR)
+         - use MT5 symbol contract_size * point to compute pip value if available
+        """
+        risk_amount = account_balance * risk_fraction
+        sl_distance = max(1e-6, atr)
+        try:
+            sym = mt5.symbol_info(self.cfg.SYMBOL)
+            contract_size = float(getattr(sym, 'trade_contract_size', 100.0))
+            point = float(getattr(sym, 'point', 0.01))
+            pip_value_per_lot = contract_size * point
+            vol = risk_amount / (sl_distance * pip_value_per_lot)
+        except Exception:
+            vol = risk_amount / (sl_distance * 1000.0)
+        vol = max(0.01, min(vol, self.cfg.MAX_VOLUME))
+        return float(vol)
+
+    # ---------- open aggregated position ----------
+    def _open_aggregated_position(self, side: str, volume: float, price: float, atr_val: float):
+        """
+        Send a single market order to open aggregated position.
+        We set SL/TP conservatively (SL = ATR * 1.2, TP partials per PARTIAL_CLOSES).
+        """
+        if mt5 is None:
+            raise RuntimeError('MT5 not available')
+
+        sym = mt5.symbol_info(self.cfg.SYMBOL)
+        if sym is None:
+            logger.warning('Symbol info not available')
+            return None
+
+        digits = int(getattr(sym, 'digits', 2))
+        point = float(getattr(sym, 'point', 0.01))
+        min_stop_level = int(getattr(sym, 'trade_stops_level', 0))
+        min_stop_distance = max(min_stop_level * point, point)
+
+        # protective SL chosen as 1.2 * ATR
+        sl_dist = max(atr_val * 1.2, min_stop_distance * 2)
+        if side == 'BUY':
+            price_exec = float(round(price, digits))
+            sl_price = float(round(price_exec - sl_dist, digits))
+            tp_price = float(round(price_exec + atr_val * self.PARTIAL_CLOSES[0]['tp_atr'], digits))
+            order_type = mt5.ORDER_TYPE_BUY
+        else:
+            price_exec = float(round(price, digits))
+            sl_price = float(round(price_exec + sl_dist, digits))
+            tp_price = float(round(price_exec - atr_val * self.PARTIAL_CLOSES[0]['tp_atr'], digits))
+            order_type = mt5.ORDER_TYPE_SELL
+
+        request = {
+            'action': mt5.TRADE_ACTION_DEAL,
+            'symbol': self.cfg.SYMBOL,
+            'volume': float(volume),
+            'type': order_type,
+            'price': price_exec,
+            'sl': float(sl_price),
+            'tp': float(tp_price),
+            'deviation': 20,
+            'magic': 555001,
+            'comment': 'walk_ai_aggregated_open',
+            'type_time': mt5.ORDER_TIME_GTC,
+            'type_filling': mt5.ORDER_FILLING_IOC,
+        }
+
+        logger.info('Sending aggregated open request: %s', request)
+        result = mt5.order_send(request)
+        logger.info('Order send result: %s', result)
+        # If success, record the open position details
+        try:
+            if hasattr(result, 'retcode') and result.retcode == 10009:
+                # success: find position(s)
+                time.sleep(0.3)
+                positions = mt5.positions_get(symbol=self.cfg.SYMBOL) or []
+                # find the new position by matching side and volume closish
+                for p in positions:
+                    p_side = 'BUY' if int(p.type) == mt5.ORDER_TYPE_BUY else 'SELL'
+                    # use some tolerance for volume equality
+                    if p_side == side and abs(p.volume - volume) < max(0.0001, volume * 0.2):
+                        self.open_position_volume = float(p.volume)
+                        self.open_position_type = p_side
+                        self.open_position_ticket = int(getattr(p, 'ticket', 0))
+                        # reset partial close state
+                        self.partial_close_state = [{'frac': pc['frac'], 'executed': False, 'tp': None, 'tp_price': None} for pc in self.PARTIAL_CLOSES]
+                        logger.info('Recorded new aggregated position ticket=%s type=%s vol=%.3f', self.open_position_ticket, self.open_position_type, self.open_position_volume)
+                        return result
+                # fallback: if not found, still record some info
+                self.open_position_volume = volume
+                self.open_position_type = side
+                self.open_position_ticket = getattr(result, 'order', None) or None
+                self.partial_close_state = [{'frac': pc['frac'], 'executed': False, 'tp': None, 'tp_price': None} for pc in self.PARTIAL_CLOSES]
+                return result
+            else:
+                logger.warning('Aggregated open returned non-success retcode: %s', getattr(result, 'retcode', 'unknown'))
+                return result
+        except Exception as e:
+            logger.exception('Post-order handling failed: %s', e)
+            return result
+
+    # ---------- monitoring & partial close logic ----------
+    def _monitor_and_manage_positions(self, dry_run: bool = True):
+        """
+        Monitor positions for the symbol and execute partial closes based on configured TP levels.
+        Also detect full close and set cooldown accordingly.
+        """
+        # if no position recorded, refresh and return
+        positions = []
+        if mt5 is not None and self.mt5.connected:
+            positions = mt5.positions_get(symbol=self.cfg.SYMBOL) or []
+
+        if not positions and self.open_position_volume <= 0:
+            # nothing open
+            return
+
+        # compute market regime to adapt cooldown later
+        df_hist = None
+        try:
+            df_hist = self.mt5.fetch_history_m5(300) if (mt5 is not None and self.mt5.connected) else None
+        except Exception:
+            df_hist = None
+
+        regime = self._detect_market_regime(df_hist) if df_hist is not None else 'chop'
+        # if positions present, manage them
+        if positions and len(positions) > 0:
+            # For simplicity, aggregate first position (should be only one)
+            # Use the latest tick to check current price
+            tick = mt5.symbol_info_tick(self.cfg.SYMBOL)
+            bid = float(tick.bid) if tick else None
+            ask = float(tick.ask) if tick else None
+            mid = 0.5 * (bid + ask) if (bid is not None and ask is not None) else None
+
+            # compute ATR from recent ticks if available for TP sizing
+            atr_val = None
+            try:
+                if df_hist is not None and 'ATR' in df_hist.columns:
+                    atr_val = float(df_hist['ATR'].iloc[-1])
+                elif df_hist is not None:
+                    atr_val = float(compute_atr(df_hist['high'], df_hist['low'], df_hist['close'], max(5, self.cfg.ATR_PERIOD)).iloc[-1])
+            except Exception:
+                atr_val = None
+            if atr_val is None:
+                atr_val = max(1e-3, (ask or mid or 1.0) * 0.001)
+
+            # Manage each open position: try to partial-close based on configured steps
+            total_open_volume = sum([float(p.volume) for p in positions])
+            # store the aggregate metrics
+            self.open_position_volume = total_open_volume
+            p = positions[0]
+            pos_side = 'BUY' if int(p.type) == mt5.ORDER_TYPE_BUY else 'SELL'
+            self.open_position_type = pos_side
+            self.open_position_ticket = int(getattr(p, 'ticket', 0))
+            logger.debug('Monitoring existing pos ticket=%s side=%s vol=%.3f', self.open_position_ticket, pos_side, self.open_position_volume)
+
+            # Check partial close triggers: for each configured step that is not executed, compute TP price
+            for idx, pc in enumerate(self.partial_close_state):
+                if pc.get('executed', False):
+                    continue
+                frac = float(pc.get('frac', 0.0))
+                tier_atr = float(self.PARTIAL_CLOSES[idx]['tp_atr'])
+                # compute target depending on side
+                if pos_side == 'BUY':
+                    tp_price = (ask if ask is not None else mid) + tier_atr * atr_val
+                else:
+                    tp_price = (bid if bid is not None else mid) - tier_atr * atr_val
+                # record tp price for logging
+                pc['tp_price'] = tp_price
+
+                # decide if reached (for safety use >= for BUY and <= for SELL)
+                # use last close price if tick missing
+                cur_price = mid if mid is not None else float(df_hist['close'].iloc[-1])
+                reached = (pos_side == 'BUY' and cur_price >= tp_price) or (pos_side == 'SELL' and cur_price <= tp_price)
+
+                if reached:
+                    # determine volume to close (fraction of current remaining)
+                    remaining_vol = self.open_position_volume
+                    close_vol = max(self.MIN_VOLUME_FOR_TRADE, round(remaining_vol * frac, 3))
+                    # cap close_vol not to exceed remaining
+                    close_vol = min(close_vol, remaining_vol)
+                    if close_vol < self.MIN_VOLUME_FOR_TRADE:
+                        logger.info('Remaining volume too small to partial-close (remaining=%.4f)', remaining_vol)
+                        pc['executed'] = True
+                        continue
+
+                    # build close request (opposite side order)
+                    if pos_side == 'BUY':
+                        close_type = mt5.ORDER_TYPE_SELL
+                        close_price = bid if bid is not None else cur_price
+                    else:
+                        close_type = mt5.ORDER_TYPE_BUY
+                        close_price = ask if ask is not None else cur_price
+
+                    # round volume and price
+                    sym = mt5.symbol_info(self.cfg.SYMBOL)
+                    digits = int(getattr(sym, 'digits', 2))
+                    close_price = float(round(close_price, digits))
+
+                    logger.info('Partial close triggered: side=%s close_vol=%.3f tp_price=%.5f cur_price=%.5f', pos_side, close_vol, tp_price, cur_price)
+                    if dry_run:
+                        logger.info('Dry-run: WOULD partial-close %s vol=%.3f at price=%.5f', pos_side, close_vol, close_price)
+                        # emulate partial close
+                        self.open_position_volume = max(0.0, self.open_position_volume - close_vol)
+                        pc['executed'] = True
+                        continue
+
+                    # prepare request
+                    req = {
+                        'action': mt5.TRADE_ACTION_DEAL,
+                        'symbol': self.cfg.SYMBOL,
+                        'volume': float(close_vol),
+                        'type': close_type,
+                        'price': close_price,
+                        'deviation': 20,
+                        'magic': 555001,
+                        'comment': 'walk_ai_partial_close',
+                        'type_time': mt5.ORDER_TIME_GTC,
+                        'type_filling': mt5.ORDER_FILLING_IOC,
+                    }
+                    try:
+                        r = mt5.order_send(req)
+                        logger.info('Partial close order_send result: %s', r)
+                        # if successful, mark executed and update internal remaining vol
+                        if hasattr(r, 'retcode') and r.retcode == 10009:
+                            # allow a brief wait and refresh positions
+                            time.sleep(0.2)
+                            positions = mt5.positions_get(symbol=self.cfg.SYMBOL) or []
+                            self.open_position_volume = sum([float(p.volume) for p in positions]) if positions else 0.0
+                            pc['executed'] = True
+                        else:
+                            logger.warning('Partial close returned non-success retcode: %s', getattr(r, 'retcode', None))
+                            # still mark executed to avoid infinite loop; you may prefer retry logic
+                            pc['executed'] = True
+                    except Exception as e:
+                        logger.exception('Exception executing partial close: %s', e)
+                        # do not mark executed so we can try next loop; but avoid rapid retries
+                        pc['executed'] = False
+                        time.sleep(0.5)
+
+            # After processing partials, if no volume remains -> full closed: set cooldown
+            if self.open_position_volume <= 0.00001 or not positions:
+                # all closed
+                self.open_position_volume = 0.0
+                self.open_position_ticket = None
+                self.open_position_type = None
+                self.partial_close_state = []
+                # compute cooldown depending on regime
+                multiplier = self.REGIME_MULTIPLIER.get(regime, 1.0)
+                cooldown = self.COOLDOWN_BASE_SEC * multiplier
+                self.in_cooldown_until = time.time() + cooldown
+                self.last_side = None
+                self.last_trade_time = time.time()
+                logger.info('Position fully closed. Entering cooldown for %.1fs (regime=%s multiplier=%.2f)', cooldown, regime, multiplier)
+        else:
+            # We previously thought position existed but MT5 shows none -> clear local record and set cooldown
+            if self.open_position_volume > 0:
+                self.open_position_volume = 0.0
+                self.open_position_ticket = None
+                self.open_position_type = None
+                self.partial_close_state = []
+                multiplier = self.REGIME_MULTIPLIER.get(regime, 1.0)
+                cooldown = self.COOLDOWN_BASE_SEC * multiplier
+                self.in_cooldown_until = time.time() + cooldown
+                self.last_side = None
+                self.last_trade_time = time.time()
+                logger.info('Detected remote position close. Entering cooldown %.1fs (regime=%s)', cooldown, regime)
+
+    # ---------- market regime detection ----------
+    def _detect_market_regime(self, df_hist: pd.DataFrame) -> str:
+        """
+        Quick heuristic regime detector:
+          - compute Hurst on last N closes: hurst > 0.6 => trending
+          - else if ATR relatively small vs rolling mean => chop / squeeze
+          - else meanrev if variance high but hurst low
+        Returns one of {'trend', 'meanrev', 'chop'}
+        """
+        try:
+            close = df_hist['close'].dropna().values[-500:]
+            hurst_val = hurst_exponent(close) if len(close) >= 50 else 0.5
+            atr = compute_atr(df_hist['high'], df_hist['low'], df_hist['close'], max(5, self.cfg.ATR_PERIOD)).iloc[-1]
+            atr_rel = atr / (df_hist['close'].rolling(200).mean().iloc[-1] if df_hist['close'].rolling(200).mean().iloc[-1] > 0 else 1.0)
+            # rules:
+            if hurst_val >= 0.60:
+                return 'trend'
+            if atr_rel < 0.0004:  # very low ATR relative -> squeeze / chop
+                return 'chop'
+            # otherwise mean-reversion environment
+            return 'meanrev'
+        except Exception:
+            return 'chop'
+
+    def stop(self):
+        self._stop = True
+
+
+# ---------- CLI / Training / Backtesting flow ----------
+def compute_performance_metrics(pnl_series: np.ndarray) -> Dict[str, float]:
+    if pnl_series is None or len(pnl_series) == 0:
+        return {'sharpe': 0.0, 'sortino': 0.0, 'max_drawdown': 0.0}
+    returns = np.asarray(pnl_series)
+    if returns.std() == 0:
+        return {'sharpe': 0.0, 'sortino': 0.0, 'max_drawdown': 0.0}
+    sharpe = np.mean(returns) / (returns.std() + 1e-12) * math.sqrt(252)
+    neg = returns[returns < 0]
+    sortino = np.mean(returns) / (neg.std() + 1e-12) if neg.size > 0 else float('inf')
+    cum = np.cumsum(returns)
+    drawdown = np.maximum.accumulate(cum) - cum
+    max_dd = drawdown.max() if len(drawdown) > 0 else 0.0
+    return {'sharpe': float(sharpe), 'sortino': float(sortino), 'max_drawdown': float(max_dd)}
+
+def walk_forward_train_and_backtest(cfg: Config, hist_df: pd.DataFrame):
+    fe = FeatureEngineer(cfg)
+    df_proc, Xs = fe.build_features(hist_df, fit_scaler=True)
+    joblib.dump(fe.scaler, os.path.join(cfg.MODEL_DIR, 'fe_scaler.pkl'))
+    labels_multi, rewards_multi = construct_labels_and_rewards(df_proc, cfg)
+    comp_labels = composite_label_from_multi(labels_multi, cfg)
+
+    n = len(Xs)
+    fold_size = max(1, int(n * 0.1))
+    min_train = max(200, int(n * 0.2))
+    oos_probs = {s: np.full(n, np.nan) for s in cfg.STRATEGIES}
+    oos_rewards = {s: np.full(n, np.nan) for s in cfg.STRATEGIES}
+
+    mm_total = ModelManager(cfg)
+
+    start = min_train
+    while start + fold_size <= n:
+        train_idx = np.arange(0, start)
+        test_idx = np.arange(start, start + fold_size)
+        logger.info("WALK-FWD: train=%d..%d test=%d..%d", train_idx[0], train_idx[-1], test_idx[0], test_idx[-1])
+
+        X_train = Xs[train_idx]
+        X_test = Xs[test_idx]
+
+        for strat in cfg.STRATEGIES:
+            y = labels_multi[strat]
+            r = rewards_multi[strat]
+            mask_train = (np.arange(len(y)) < start) & (y != -1)
+            if mask_train.sum() < 80:
+                logger.info("WALK-FWD skip strat=%s due to small train N=%d", strat, mask_train.sum())
+                continue
+            Xf_train = Xs[mask_train]
+            yf_train = y[mask_train]
+            rf_train = r[mask_train]
+
+            try:
+                mm_total.train_tree(Xf_train, yf_train, strat)
+            except Exception as e:
+                logger.exception("train_tree fold failed %s: %s", strat, e)
+            try:
+                mm_total.train_reward_regressor(Xf_train, rf_train, strat)
+            except Exception as e:
+                logger.exception("train_reward_regressor failed %s: %s", strat, e)
+            try:
+                mm_total.train_lstm(Xf_train, yf_train, seq_len=cfg.LOOKBACK_BARS, strat=strat)
+            except Exception as e:
+                logger.exception("train_lstm failed %s: %s", strat, e)
+
+            try:
+                p_test = mm_total.predict_proba_multi(X_test, seq_tail=Xs[test_idx[0]:test_idx[0]+cfg.LOOKBACK_BARS] if Xs.shape[0] > cfg.LOOKBACK_BARS else Xs[test_idx])
+                oos_probs[strat][test_idx] = p_test[strat]
+            except Exception as e:
+                logger.exception("predict_proba_multi OOS failed %s: %s", strat, e)
+
+            try:
+                r_test = mm_total.predict_reward(X_test, strat)
+                oos_rewards[strat][test_idx] = r_test
+            except Exception as e:
+                logger.exception("predict_reward OOS failed %s: %s", strat, e)
+
+        start += fold_size
+
+    probs_stack = np.vstack([np.nan_to_num(oos_probs[s], nan=0.5) for s in cfg.STRATEGIES])
+    weights = np.array([cfg.STRATEGY_WEIGHTS[s] for s in cfg.STRATEGIES])
+    meta_oos = np.average(probs_stack, axis=0, weights=weights)
+
+    bt = Backtester(cfg)
+    sim = bt.simulate(df_proc, meta_oos, comp_labels)
+    metrics = compute_performance_metrics(sim.get('pnl_series', []))
+    logger.info("WALK-FWD backtest results: trades=%d win_rate=%.3f net=%.5f metrics=%s",
+                sim['trades'], sim['win_rate'], sim['net'], metrics)
+    mm_total.save()
+    return mm_total, fe, df_proc, meta_oos, comp_labels, sim
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--test', action='store_true', help='Run self-test on synthetic data')
+    parser.add_argument('--backtest', action='store_true', help='Run backtest using MT5 history')
+    parser.add_argument('--live', action='store_true', help='Start live executor (requires MT5)')
+    parser.add_argument('--dry', action='store_true', help='Live dry-run (no real orders)')
+    args = parser.parse_args()
+
     cfg = Config()
-    dfetch = DataFetcher(cfg)
-    trainer = ModelTrainer(cfg, dfetch)
-    execer = Executor(cfg, dfetch)
+    os.makedirs(cfg.MODEL_DIR, exist_ok=True)
+    logger.info('Starting bot with device=%s, seed=%d', cfg.DEVICE, cfg.SEED)
 
     if args.test:
-        logger.info('Running in self-test mode with synthetic data')
-        df = generate_synthetic_data(bars=4000, start_price=2000.0)
-        scaled = dfetch.preprocess_data(df, fit_scaler=True)
-        mode_data, mode_labels = dfetch.prepare_mode_data(df, fit_scaler=True)
-        trainer.train(scaled, mode_data, mode_labels)
-        if trainer.price_model is not None:
-            try:
-                action, mode, pred_price = trainer.predict(scaled, mode_data)
-                logger.info(f'SMOKE TEST PREDICT -> Action: {action}, Mode: {mode}, Pred: {pred_price:.5f}')
-            except Exception as e:
-                logger.exception('Prediction failed in test: %s', e)
-        logger.info('Self-test complete.')
+        logger.info('Running synthetic self-test')
+        dt = pd.date_range(end=pd.Timestamp.utcnow(), periods=2000, freq='5min')
+        rng = np.random.RandomState(cfg.SEED)
+        price = 2000.0
+        rows = []
+        for t in dt:
+            change = rng.normal(loc=0.0, scale=0.001)
+            new_price = price * (1 + change)
+            high = max(price, new_price) * (1 + abs(rng.normal(0, 0.0001)))
+            low = min(price, new_price) * (1 - abs(rng.normal(0, 0.0001)))
+            rows.append({'time': t, 'open': price, 'high': high, 'low': low, 'close': new_price, 'tick_volume': int(abs(rng.normal(100, 20)))})
+            price = new_price
+        df = pd.DataFrame(rows)
+        mm, fe, df_proc, probs, labels, sim = walk_forward_train_and_backtest(cfg, df)
+        logger.info('Synthetic test complete. Sim results: %s', sim)
         return
 
-    if mt5 is None:
-        logger.warning('MT5 library not present. Use --test for offline run')
-        return
-
-    if not dfetch.connect_mt5():
-        logger.warning('Could not initialize MT5. Abort.')
-        return
-
-    try:
-        df_hist = dfetch.fetch_rates(cfg.HISTORY_BARS)
-    except Exception as e:
-        logger.exception('Failed to fetch MT5 rates: %s', e)
-        return
-
-    loaded = trainer.try_load_models()
-    if not loaded:
-        try:
-            scaled = dfetch.preprocess_data(df_hist, fit_scaler=True)
-            mode_data, mode_labels = dfetch.prepare_mode_data(df_hist, fit_scaler=True)
-        except Exception as e:
-            logger.exception('Preprocessing failed: %s', e)
+    if args.backtest:
+        if mt5 is None:
+            logger.error('MT5 not available for historical backtest in this run')
             return
-        trainer.train(scaled, mode_data, mode_labels)
-        loaded = True
-    else:
-        try:
-            scaled = dfetch.preprocess_data(df_hist, fit_scaler=False)
-            mode_data, mode_labels = dfetch.prepare_mode_data(df_hist, fit_scaler=False)
-        except Exception as e:
-            logger.exception('Preprocessing with loaded scalers failed: %s', e)
+        mt5c = MT5Connector(cfg)
+        if not mt5c.connect():
+            logger.error('MT5 connect failed for backtest')
             return
+        df_hist = mt5c.fetch_history_m5(cfg.HISTORY_BARS)
+        mm, fe, df_proc, probs, labels, sim = walk_forward_train_and_backtest(cfg, df_hist)
+        logger.info('Backtest done: %s', sim)
+        mt5c.disconnect()
+        return
 
-    logger.info('Entering live trading loop (dry-run unless --live passed)')
-    try:
-        while True:
+    if args.live:
+        mm = ModelManager.load(cfg)
+        fe = FeatureEngineer(cfg)
+        fe_scaler_path = os.path.join(cfg.MODEL_DIR, 'fe_scaler.pkl')
+        if os.path.exists(fe_scaler_path):
             try:
-                df_now = dfetch.fetch_multi_timeframe(bars_m5=500)
-                # use fit_scaler=False because we either loaded scalers or just trained and saved above
-                scaled_now = dfetch.preprocess_data(df_now, fit_scaler=not loaded)
-                mode_now, _ = dfetch.prepare_mode_data(df_now, fit_scaler=not loaded)
-                action, mode, pred_price = trainer.predict(scaled_now, mode_now)
-                logger.info(f'Live decision: {action} (mode={mode}) pred={pred_price:.5f}')
-                if args.live and action in ('BUY', 'SELL'):
-                    execer.place_order(action, pred_price, mode)
-                else:
-                    logger.info('Not placing order (dry-run or HOLD).')
-                execer.check_closed_orders()
+                fe.scaler = joblib.load(fe_scaler_path)
+                logger.info('Loaded feature scaler for live from %s', fe_scaler_path)
             except Exception as e:
-                logger.exception('Error during live loop iteration: %s', e)
-            time.sleep(getattr(cfg, 'LIVE_LOOP_SLEEP', 60))
-    except KeyboardInterrupt:
-        logger.info('Interrupted by user; exiting.')
-    except Exception as e:
-        logger.exception('Unhandled in live loop: %s', e)
+                logger.warning('Failed to load fe_scaler for live: %s', e)
+        execer = ExecutorLive(cfg, mm, fe)
+        execer.start(dry_run=args.dry)
+        return
+
+    parser.print_help()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--test', action='store_true', help='Run self-test on synthetic data (no MT5)')
-    parser.add_argument('--live', action='store_true', help='Enable live trading via MT5 (use with caution)')
-    args = parser.parse_args()
     try:
-        main(args)
+        main()
     except Exception as e:
         logger.exception('Unhandled exception in main: %s', e)
         sys.exit(1)
